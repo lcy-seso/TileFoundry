@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: clang-format
+        name: clang-format
+        entry: clang-format -i
+        language: system
+        files: \.(h|hpp|cuh|cu|cpp|cc)$
+      - id: spec-rules-lint
+        name: spec-rules-lint
+        entry: python scripts/spec_rules_lint.py
+        language: system
+        files: ^docs/spec/.*\.md$

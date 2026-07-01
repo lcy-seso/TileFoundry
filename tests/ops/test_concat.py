@@ -1,0 +1,51 @@
+"""Concat typeinfer: the concat axis sums; an all-unsharded concat produces an
+unsharded output, and a genuinely-sharded input drops to an unsharded output
+rather than carrying a fake layout onto the concatenated shape."""
+from __future__ import annotations
+
+import pytest
+import torch
+
+from tilefoundry.ir.hir.tensor.concat import Concat
+from tilefoundry.ir.types import DType
+from tilefoundry.ir.types.shard.shard_layout import Split
+from tests.ops.eval_utils import EvalCase, run_eval_case
+from tests.ops.typeinfer_utils import (
+    TypeInferCase,
+    mesh,
+    run_typeinfer_case,
+    sharded,
+    ten,
+)
+
+_F = DType.f32
+_M = mesh((4,))
+
+CASES = [
+    TypeInferCase(
+        "unsharded",
+        Concat(axis=0),
+        (ten((4, 8), _F), ten((4, 8), _F)),
+        ten((8, 8), _F),
+    ),
+    # a genuine sharding on any input drops to None rather than carry a fake
+    # layout onto the concatenated shape.
+    TypeInferCase(
+        "sharded_drops_layout",
+        Concat(axis=0),
+        (sharded((4, 8), (Split(1),), _M), ten((4, 8), _F)),
+        ten((8, 8), _F),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
+def test_concat_typeinfer(case):
+    run_typeinfer_case(case)
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["axis0", "axis1"])
+def test_concat_evaluate(axis):
+    torch.manual_seed(0)
+    _ca, _cb = torch.randn(2, 3), torch.randn(2, 3)
+    run_eval_case(EvalCase("", Concat(axis=axis), (_ca, _cb), torch.cat([_ca, _cb], dim=axis)))

@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tilefoundry"
+version = "0.1.0"
+description = "A tile-based, agentic platform for automatic high-performance program generation across hardware."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "isl-python>=0.1.8",
+    "jinja2>=3.0",
+    "apache-tvm-ffi",
+    "torch",
+    "graphviz>=0.20",
+    "transformers>=4.57",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+dev = ["pre-commit>=3"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"tilefoundry.codegen.cuda.templates" = ["*.j2"]
+"tilefoundry.codegen.cpu.templates" = ["*.j2"]
+
+[tool.pytest.ini_options]
+markers = [
+    "no_dump: opt out of the autouse DumpScope for tests that emit excessive dump output",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Selected rule families:
+#   E, W  pycodestyle (PEP 8 errors / warnings)
+#   F     pyflakes    (unused / undefined / shadowed)
+#   I     isort       (import order)
+# Plus one extra rule from pylint conventions:
+#   PLC0415  import-outside-top-level
+select = ["E", "F", "W", "I", "PLC0415"]
+
+# Ignored rules:
+#   E501  line-too-long — long strings / compact code stay on one line.
+#   F821  undefined-name — quoted forward-ref annotations like
+#         ``def _(call: "Call", ctx: "TypeInferContext")`` use
+#         Python-language forward-refs to break import cycles without
+#         ``TYPE_CHECKING`` shims.
+#   E741  ambiguous-variable-name — single-letter variables (``l`` /
+#         ``r`` / ``a``) are allowed.
+ignore = ["E501", "F821", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# DSL tests use `from tilefoundry.dsl import *` as part of the
+# authoring-surface ergonomics. Internal implementation code in
+# `src/` must NOT use star imports (no exception here).
+"tests/**/*.py" = ["F403", "F405"]
+

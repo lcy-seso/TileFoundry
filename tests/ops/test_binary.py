@@ -1,0 +1,174 @@
+"""Binary typeinfer over the relation-driven path.
+
+Binary derives its output shape by right-aligned NumPy broadcast and its
+output ``ShardLayout`` from the shared shard-propagation engine. A layout
+mismatch between genuinely-sharded operands is an error (no silent lhs pick);
+replicated operands and unsharded layouts pass through.
+"""
+from __future__ import annotations
+
+import pytest
+import torch
+
+from tilefoundry.ir.core.kinds import BinaryKind
+from tilefoundry.ir.hir.math.binary import Binary
+from tilefoundry.ir.target.storage import StorageKind
+from tilefoundry.ir.types import DType
+from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.ir.types.shard.shard_layout import Broadcast, Split
+from tests.ops.eval_utils import EvalCase, run_eval_case
+from tests.ops.typeinfer_utils import (
+    ExpectedError,
+    TypeInferCase,
+    mesh,
+    run_typeinfer_case,
+    sharded,
+    ten,
+)
+
+_ADD = Binary(kind=BinaryKind.ADD)
+_F = DType.f32
+
+# A single-axis mesh (g=4) for flat shards and a two-axis mesh (a=2, b=4) for
+# factorized shards; cases reuse these so no test hand-builds a Mesh.
+_M = mesh((4,))
+_MAB = mesh((2, 4), ("a", "b"))
+
+CASES = [
+    # ── shape inference (unsharded) ──────────────────────────────────────────
+    TypeInferCase("same_shape", _ADD, (ten((4, 8), _F), ten((4, 8), _F)), ten((4, 8), _F)),
+    TypeInferCase("size1_broadcast", _ADD, (ten((4, 8), _F), ten((1, 8), _F)), ten((4, 8), _F)),
+    TypeInferCase("different_rank_broadcast", _ADD, (ten((4, 8), _F), ten((8,), _F)), ten((4, 8), _F)),
+    TypeInferCase("scalar_broadcast", _ADD, (ten((), _F), ten((4, 8), _F)), ten((4, 8), _F)),
+    TypeInferCase(
+        "dynamic_dim",
+        _ADD,
+        (ten((DimVar("N", 1, 64), 8), _F), ten((DimVar("N", 1, 64), 8), _F)),
+        ten((DimVar("N", 1, 64), 8), _F),
+    ),
+    TypeInferCase(
+        "dtype_mismatch",
+        _ADD,
+        (ten((4, 8), _F), ten((4, 8), DType.bf16)),
+        ExpectedError(match="dtype mismatch"),
+    ),
+    # ── shard propagation ────────────────────────────────────────────────────
+    # lhs split, rhs replicated → output keeps lhs's split.
+    TypeInferCase(
+        "sharded_lhs_replicated_rhs",
+        _ADD,
+        (sharded((16, 8), (Split(0),), _M), ten((16, 8), _F)),
+        sharded((16, 8), (Split(0),), _M),
+    ),
+    # both split the same axis identically → that split.
+    TypeInferCase(
+        "both_split_same_axis",
+        _ADD,
+        (sharded((16, 8), (Split(0),), _M), sharded((16, 8), (Split(0),), _M)),
+        sharded((16, 8), (Split(0),), _M),
+    ),
+    # split side + broadcast side: lhs (4,8) split axis 0, rhs (8,) broadcasts.
+    TypeInferCase(
+        "split_side_plus_broadcast_side",
+        _ADD,
+        (sharded((4, 8), (Split(0),), _M), ten((8,), _F)),
+        sharded((4, 8), (Split(0),), _M),
+    ),
+    # lower-rank split rhs / lhs right-aligns to output axis 1.
+    TypeInferCase(
+        "lower_rank_rhs_split",
+        _ADD,
+        (ten((4, 8), _F), sharded((8,), (Split(0),), _M)),
+        sharded((4, 8), (Split(1),), _M),
+    ),
+    TypeInferCase(
+        "lower_rank_lhs_split",
+        _ADD,
+        (sharded((8,), (Split(0),), _M), ten((4, 8), _F)),
+        sharded((4, 8), (Split(1),), _M),
+    ),
+    # lhs splits axis 0, rhs splits axis 1 on the same mesh axis → conflict,
+    # not a silent lhs pick.
+    TypeInferCase(
+        "incompatible_split",
+        _ADD,
+        (sharded((16, 8), (Split(0),), _M), sharded((16, 8), (Split(1),), _M)),
+        ExpectedError(match="incompatible"),
+    ),
+    # two mesh axes split the same tensor axis (neither operand supplies both):
+    # the output factorizes axis 0 into one sub-position per mesh extent.
+    TypeInferCase(
+        "two_mesh_axes_synthesize_factorized",
+        _ADD,
+        (
+            sharded((8,), (Split(0), Broadcast()), _MAB),
+            sharded((8,), (Broadcast(), Split(0)), _MAB),
+        ),
+        sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)),
+    ),
+    # one operand already carries the full factorized layout → carried through.
+    TypeInferCase(
+        "factorized_input_passes_through",
+        _ADD,
+        (sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)), ten((8,), _F)),
+        sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)),
+    ),
+    # ── output storage (anchor on concrete residency) ────────────────────────
+    # An unmaterialized literal operand (storage=umat) abstains; the concrete
+    # operand anchors the output, independent of operand order.
+    TypeInferCase(
+        "literal_rhs_anchors_gmem",
+        _ADD,
+        (ten((4, 8), _F, storage="gmem"), ten((), _F, storage=StorageKind.UMAT)),
+        ten((4, 8), _F, storage="gmem"),
+    ),
+    TypeInferCase(
+        "literal_lhs_anchors_gmem",
+        _ADD,
+        (ten((), _F, storage=StorageKind.UMAT), ten((4, 8), _F, storage="gmem")),
+        ten((4, 8), _F, storage="gmem"),
+    ),
+    TypeInferCase(
+        "both_gmem",
+        _ADD,
+        (ten((4, 8), _F, storage="gmem"), ten((4, 8), _F, storage="gmem")),
+        ten((4, 8), _F, storage="gmem"),
+    ),
+    TypeInferCase(
+        "both_rmem",
+        _ADD,
+        (ten((4, 8), _F, storage="rmem"), ten((4, 8), _F, storage="rmem")),
+        ten((4, 8), _F, storage="rmem"),
+    ),
+    # All operands unmaterialized (e.g. `1 + 1`) → output stays unmaterialized.
+    TypeInferCase(
+        "all_unmaterialized",
+        _ADD,
+        (ten((), _F, storage=StorageKind.UMAT), ten((), _F, storage=StorageKind.UMAT)),
+        ten((), _F, storage=StorageKind.UMAT),
+    ),
+    # Two different concrete residencies have no anchor → error, not a pick.
+    TypeInferCase(
+        "conflicting_concrete_storage",
+        _ADD,
+        (ten((4, 8), _F, storage="gmem"), ten((4, 8), _F, storage="rmem")),
+        ExpectedError(match="conflicting storage"),
+    ),
+]
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
+def test_binary_typeinfer(case):
+    run_typeinfer_case(case)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [BinaryKind.ADD, BinaryKind.SUB, BinaryKind.MUL],
+    ids=["add", "sub", "mul"],
+)
+def test_binary_evaluate(kind):
+    torch.manual_seed(0)
+    _a, _b = torch.randn(2, 3), torch.randn(2, 3)
+    expected = {BinaryKind.ADD: _a + _b, BinaryKind.SUB: _a - _b, BinaryKind.MUL: _a * _b}[kind]
+    run_eval_case(EvalCase("", Binary(kind=kind), (_a, _b), expected))
