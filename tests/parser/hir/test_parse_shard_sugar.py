@@ -440,3 +440,82 @@ def test_reshard_sugar_rejects_dynamic_split_axis() -> None:
         parse_shard_layout_sugar(
             node, lambda n: cta if n == "cta" else None, closure={"S": _S_DYN}
         )
+
+
+# ── closure / static-int dims in a mesh-shape sugar (task #5 P1/P2) ───────────
+# These exercise the ``with Mesh(Topology(...), (dims), names)`` body path
+# (`parse_mesh_layout_sugar`), which — unlike the shard/split path above — did
+# not thread the closure and rejected any ``ast.Name`` dim.
+
+
+def _mesh_body_fn(threads, warps, lanes):
+    """Build a nested ``@func`` whose mesh-shape sugar reads its dims from the
+    enclosing closure (``threads``/``warps``/``lanes``)."""
+
+    @func(topologies=(Topology("thread", threads),))
+    def _f(x: Tensor[(1, 128), "bf16"]) -> Tensor[(1, 128), "bf16"]:
+        with Mesh(Topology("thread", threads), (warps, lanes), ("w", "t")) as m:
+            xr = reshard(x, (1, 128 @ (m.w, m.t)), "rmem")  # noqa: F821
+            return reshard(xr, (1, 128), "gmem")  # noqa: F821
+
+    return _f
+
+
+def _mesh_body_literal():
+    """The all-literal equivalent of :func:`_mesh_body_fn` (128, 4, 32)."""
+
+    @func(topologies=(Topology("thread", 128),))
+    def _f(x: Tensor[(1, 128), "bf16"]) -> Tensor[(1, 128), "bf16"]:
+        with Mesh(Topology("thread", 128), (4, 32), ("w", "t")) as m:
+            xr = reshard(x, (1, 128 @ (m.w, m.t)), "rmem")  # noqa: F821
+            return reshard(xr, (1, 128), "gmem")  # noqa: F821
+
+    return _f
+
+
+def test_closure_int_mesh_dims_resolve_like_literals() -> None:
+    """E1: closure/global ints in a mesh-shape sugar (``(WARPS, LANES)`` and the
+    topology extent ``THREADS``) resolve identically to integer literals — the
+    parser must not reject the ``ast.Name``."""
+    assert as_script(_mesh_body_fn(128, 4, 32)) == as_script(_mesh_body_literal())
+
+
+def test_closure_int_split_extent_still_parses() -> None:
+    """E2 (regression lock): a closure int as a split extent already works and
+    must keep working."""
+    k_tile = 128
+
+    @func(topologies=(Topology("thread", 128),))
+    def _f(x: Tensor[(1, 128), "bf16"]) -> Tensor[(1, 128), "bf16"]:
+        with Mesh(Topology("thread", 128), (4, 32), ("w", "t")) as m:
+            xr = reshard(x, (1, k_tile @ (m.w, m.t)), "rmem")  # noqa: F821
+            return reshard(xr, (1, 128), "gmem")  # noqa: F821
+
+    assert _f.name == "_f"
+
+
+def test_dimvar_mesh_dim_reports_static_int() -> None:
+    """E4: a ``DimVar`` in a mesh-shape position is rejected with a clear
+    static-int diagnostic (not a raw ``expected int dim`` / attribute error)."""
+    w = DimVar("W", 1, 8)
+
+    with pytest.raises(ValueError, match="static int"):
+
+        @func(topologies=(Topology("thread", 128),))
+        def _bad(x: Tensor[(1, 128), "bf16"]) -> Tensor[(1, 128), "bf16"]:
+            with Mesh(Topology("thread", 128), (w, 32), ("w", "t")) as m:
+                xr = reshard(x, (1, 128 @ (m.w, m.t)), "rmem")  # noqa: F821
+                return reshard(xr, (1, 128), "gmem")  # noqa: F821
+
+
+def test_bool_mesh_dim_rejected() -> None:
+    """E5: ``bool`` is rejected as a mesh dim even though it subclasses ``int``."""
+    warps = True
+
+    with pytest.raises(ValueError, match="static int"):
+
+        @func(topologies=(Topology("thread", 128),))
+        def _bad(x: Tensor[(1, 128), "bf16"]) -> Tensor[(1, 128), "bf16"]:
+            with Mesh(Topology("thread", 128), (warps, 32), ("w", "t")) as m:
+                xr = reshard(x, (1, 128 @ (m.w, m.t)), "rmem")  # noqa: F821
+                return reshard(xr, (1, 128), "gmem")  # noqa: F821

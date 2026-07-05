@@ -130,9 +130,10 @@ axis-tuple    ::= '(' axis-spec (',' axis-spec)* ','? ')'
 axis-spec     ::= axis-extent                    ; a cute dim, not split (axis placement only)
                 | static-extent '@' mesh-axis    ; Split(axis_index) on mesh-axis
                 | static-extent '@' '(' mesh-axis (',' mesh-axis)* ')'  ; sequential decomposition
-axis-extent   ::= static-extent | dim-ref        ; a bare axis may be dynamic
-static-extent ::= integer-literal                ; split axes must be a static int
-dim-ref       ::= identifier                     ; closure-resolved DimVar (or int); bare axes only
+axis-extent    ::= static-extent | dim-ref        ; a bare axis may be dynamic
+static-extent  ::= integer-literal | static-dim-ref  ; split axes & mesh dims: a static int
+dim-ref        ::= identifier                     ; closure-resolved DimVar (or int); bare axes only
+static-dim-ref ::= identifier                     ; closure/global name bound to a static int (bool rejected)
 stride-tuple  ::= '(' integer-literal (',' integer-literal)* ','? ')'
 value-state   ::= '{' partial-spec (',' partial-spec)* ','? '}'  ; a set; only the last outer item
 partial-spec  ::= mesh-axis '@' 'P(' '"' reduction '"' ')'       ; Partial(reduction) on mesh-axis
@@ -147,6 +148,15 @@ axis is `Broadcast` (carries no mesh binding). A **split** extent
 (`static-extent` on the left of `@`) MUST resolve to a static int: it
 participates in mesh-extent canonicalisation (factorisation), which a
 dynamic extent cannot. A dynamic split extent is rejected.
+
+A `static-extent` — whether a split extent (left of `@`) or a
+**mesh-shape** dim in a mesh's own layout tuple (e.g. `(WARPS, LANES)` in
+`Mesh(Topology("thread", THREADS), (WARPS, LANES), …)`) — may be written as an
+`integer-literal` or a `static-dim-ref`: a closure/global identifier bound to a
+static `int` (e.g. `WARPS = 4`). Both resolve identically. A `bool` is rejected
+even though it subclasses `int`, and a dynamic (`DimVar`) or otherwise non-int
+value in a `static-extent` position is rejected with a `must be a static int`
+diagnostic (never a raw AST or attribute error).
 
 A dynamic bare axis is admissible only where `Reshard` materialises strides
 in the **shared-engine** form — a same-storage reshard off a plain (non
