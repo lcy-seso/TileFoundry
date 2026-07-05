@@ -149,10 +149,9 @@ axis is `Broadcast` (carries no mesh binding). A **split** extent
 participates in mesh-extent canonicalisation (factorisation), which a
 dynamic extent cannot. A dynamic split extent is rejected.
 
-A `static-extent` (a split extent or a mesh-shape dim) accepts an
-`integer-literal` or a `static-dim-ref` (a closure/global name bound to a static
-int); a `bool` or a dynamic (`DimVar`) / non-int value is rejected with a
-`must be a static int` diagnostic.
+Closure/global int resolution applies to mesh-shape dims too; a `bool` or
+dynamic value in a `static-extent` is rejected with a `must be a static int`
+diagnostic.
 
 A dynamic bare axis is admissible only where `Reshard` materialises strides
 in the **shared-engine** form — a same-storage reshard off a plain (non
