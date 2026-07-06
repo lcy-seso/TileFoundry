@@ -15,10 +15,7 @@ from tilefoundry.ir.types import UnitType
 
 @register_op
 class Fill(Op):
-    """Fills ``tensor`` element-wise with ``value`` (rank-0 scalar).
-
-    Spec: tir.md §3.1
-    """
+    """Fills ``tensor`` element-wise with ``value`` (rank-0 scalar)."""
     tensor = ParamDef(kind="input", pattern=Tensor)
     value = ParamDef(kind="input", pattern=Tensor)
 

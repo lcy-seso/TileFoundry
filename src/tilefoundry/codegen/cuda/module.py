@@ -98,9 +98,8 @@ def emit_cuda_module(cuda_fns: tuple[PrimFunction, ...]) -> LinkableModule:
                 f"but {f.kernel_name!r} has (grid={f.grid}, block={f.block})"
             )
     specs = _topology_shape_specializations(base.grid, base.block)
-    # A module that emits a grid barrier gets its own internal-linkage counter
-    # pair defined in this source; the runtime header carries only the helper,
-    # so multiple modules in one image never collide on a shared global symbol.
+    # A module that emits a grid barrier defines its own counter pair (internal
+    # linkage) in this source.
     uses_grid_barrier = any("tf_grid_bar_state" in text for text in kernel_texts)
     source = render(
         "cuda_module.cu.j2",

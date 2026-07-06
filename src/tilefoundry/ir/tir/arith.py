@@ -24,10 +24,7 @@ __all__ = ["BinaryKind", "Binary", "UnaryKind", "Unary"]
 
 @register_op(dialect="T", category="arith")
 class Binary(Op):
-    """Effect-form pointwise binary operation: ``dst = lhs <kind> rhs``.
-
-    Spec: tir.md §3.4
-    """
+    """Effect-form pointwise binary operation: ``dst = lhs <kind> rhs``."""
     lhs = ParamDef(kind="input", pattern=Tensor)
     rhs = ParamDef(kind="input", pattern=Tensor)
     dst = ParamDef(kind="input", pattern=Tensor)
@@ -49,10 +46,7 @@ def _(call: "Call", ctx: "VerifyContext") -> None:
 
 @register_op(dialect="T", category="arith")
 class Unary(Op):
-    """Effect-form pointwise unary operation: ``dst = <kind>(src)``.
-
-    Spec: tir.md §3.4
-    """
+    """Effect-form pointwise unary operation: ``dst = <kind>(src)``."""
     src = ParamDef(kind="input", pattern=Tensor)
     dst = ParamDef(kind="input", pattern=Tensor)
     kind = ParamDef(kind="attribute", annotation=UnaryKind)

@@ -1,10 +1,7 @@
 """Emitters for the ``cp.async`` TIR ops.
 
-``CopyAsync`` forwards to the runtime helper ``tilefoundry::ops::copy_async``
-(the async analogue of ``tilefoundry::ops::copy_n`` — the runtime owns the
-per-thread projection, 16B-chunk vectorization, and scalar tail).
-``CpAsyncCommit`` / ``CpAsyncWait`` emit the group fences directly, mirroring
-how ``sync.py`` emits its barrier PTX.
+``CopyAsync`` forwards to ``tilefoundry::ops::copy_async``; ``CpAsyncCommit`` /
+``CpAsyncWait`` emit the group-fence PTX directly.
 """
 from __future__ import annotations
 

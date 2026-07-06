@@ -106,14 +106,12 @@ target group.
 ### 3.1 Runtime-owned op dispatch
 
 Where more than one runtime template implements an op, codegen emits **one
-uniform runtime op call**, passing the operand layouts (and any codegen-static
-participant geometry) as compile-time template parameters; the **runtime op owns
-the scope / layout dispatch** to its implementations. Codegen does not select an
-implementation or compute per-implementation parameters, and the selection is
-not carried on the TIR op. The per-op dispatch contract (e.g. how a sharded
-reduce derives its reduction level and workspace grouping, or how a mesh-scoped
-barrier derives its participant predicate) lives in the runtime
-([`runtime.md §3`](runtime.md)).
+uniform runtime op call**, passing the operand `ShardLayout`s (and any
+codegen-static participant geometry) as compile-time template parameters. The
+runtime template dispatches on those layouts at compile time; codegen does not
+select a tier, compute a per-tier parameter, or carry the selection on the TIR
+op. This is the codegen side of the runtime-owned dispatch principle, whose
+contract lives in [runtime.md §3](runtime.md#3-runtime-ops).
 
 ## 4. Codegen products
 

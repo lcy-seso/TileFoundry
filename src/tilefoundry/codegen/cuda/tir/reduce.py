@@ -1,14 +1,8 @@
-"""Codegen for generic Reduce TIR stmt — tag-dispatched.
+"""Codegen for the Reduce TIR stmt — emits the uniform runtime reduce call.
 
-The 3-arg form ``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)``
-is the sharded-reduce entry. Forwarded directly when the TIR call
-carries an optional ``workspace`` 3rd input (lowering emitted an
-``AllocTensor(storage=smem)`` for cross-warp staging); the runtime
-derives the reduction level and its warps_per_group from the operand
-layouts. The 2-arg ``reduce<Op, Axes>(src, dst)`` form remains for
-intra-warp / unsharded reductions; the legacy ``reduce_1d`` /
-``reduce(M, K, ...)`` rank-aware kernels are kept as a fallback for
-the non-sharded code path.
+A sharded reduce emits ``reduce_sharded<Op, Axes>(src, dst, workspace)`` when the
+lowering provided a workspace, else the 2-arg ``reduce<Op, Axes>(src, dst)``; a
+non-sharded reduce emits the rank-aware ``reduce_1d`` / ``reduce`` fallback.
 """
 
 from __future__ import annotations
@@ -43,21 +37,11 @@ def _emit(call, ctx: CodegenContext) -> None:
     is_sharded = isinstance(getattr(src_ty, "layout", None), ShardLayout)
 
     if is_sharded:
-        # Two codegen-facing entries: the intra-warp ``reduce<>(src, dst)`` when
-        # no workspace is needed, and the workspace-carrying
-        # ``reduce_sharded<>(src, dst, ws)`` otherwise. The lowering
-        # (``_analyze_cross_warp_workspace``) sizes the workspace capacity and
-        # decides which entry applies (``workspace_size == 0`` → 2-arg); the
-        # runtime ``reduce_sharded`` selects the cross-warp tier and its
-        # warps_per_group from the operand layouts. Cross-CTA reduce is rejected
-        # upstream, not emitted here.
+        # 3-arg ``reduce_sharded`` when the lowering sized a workspace
+        # (``_analyze_cross_warp_workspace``), else the 2-arg ``reduce``.
         axes_t = _axes_pack_typename(call.target.axes)
         if len(call.args) >= 3:
             ws_n = ctx.name_for(call.args[2])
-            # The runtime derives the reduction level (intra-warp-folded vs
-            # cross-warp-only) and its warps_per_group from the operand
-            # ShardLayouts (see runtime ``reduce_sharded``); codegen emits only
-            # the uniform entry plus the operands.
             ctx.emit(
                 f"tilefoundry::ops::reduce_sharded<{op_tag}, {axes_t}>"
                 f"({src_n}, {dst_n}, {ws_n});"

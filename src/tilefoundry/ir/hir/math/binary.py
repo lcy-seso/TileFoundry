@@ -42,10 +42,7 @@ _INT_ONLY_KINDS = {BinaryKind.FLOOR_DIV, BinaryKind.MOD}
 
 @register_op(dialect="tf", category="math")
 class Binary(Op):
-    """Value-form pointwise binary operation.
-
-    Spec: hir.md §2.1
-    """
+    """Value-form pointwise binary operation."""
     lhs = ParamDef(kind="input", pattern=Tensor)
     rhs = ParamDef(kind="input", pattern=Tensor)
     kind = ParamDef(kind="attribute", annotation=BinaryKind)

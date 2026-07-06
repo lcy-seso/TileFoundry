@@ -117,7 +117,7 @@ def _materialize_reshard_strides(
     src_ty: TensorType,
     new_storage: StorageKind,
 ) -> ShardLayout:
-    """Materialize ``layout.layout.strides`` per docs/spec/hir.md §2.5.
+    """Materialize the sugar-default ``layout.layout.strides``.
 
     Pre-condition: ``layout.layout.strides is None`` (sugar). For
     verbose paths the caller short-circuits before this helper.
@@ -149,80 +149,13 @@ def _materialize_reshard_strides(
 
 @register_op
 class Reshard(Op):
-    """Convert *x* to a target layout / storage in place (logical view).
-
-    Spec: hir.md §2.5
-
-    a single ``reshard`` Op covers layout / sharding / storage changes
-    plus the logical-shape view shifts that arise from sharding (e.g.
-    ``(1, 64)`` plain → ``(1, 8192 @ cta)`` sharded on a 128-cta mesh —
-    physically each cta still holds 64, logically the TensorType shape
-    is 8192). Local memory rearrangement (transpose / flatten / etc.)
-    is **not** in scope — use :class:`Reshape` for that.
-
-    Both kwargs are optional: omitting ``layout`` preserves
-    ``input.layout``; omitting ``storage`` preserves ``input.storage``.
-
-    The single op covers all four physical kinds (zero-copy view /
-    cross-storage copy / cross-CTA redistribute / mixed); typeinfer +
-    costmodel classify each call from its input ↔ output TensorType
-    delta. The IR keeps one node per user call.
-
-    Semantics. Let ``src = x.type``; storage direction follows the physical
-    addressability hierarchy ``rmem < smem < gmem`` (per-thread / per-CTA /
-    per-program). Typeinfer dispatches on ``(layout, storage)``:
-
-    - ``layout=None``, storage unchanged → ``src`` (no-op).
-    - ``layout=None``, storage changed → error (storage change MUST carry an
-      explicit ``layout=``).
-    - ``layout=Layout(strides=None)`` (sugar), storage unchanged → dest strides
-      match the form already on ``src.layout``: Split-axes-zero ⇒ per-instance
-      form; else ⇒ shared-engine C-order over the canonical global shape. When
-      ``src.layout is None`` (plain kernel-param), fall back to shared-engine
-      C-order.
-    - ``layout=Layout(strides=None)`` (sugar), low → high level → dest strides =
-      C-order over ``layout.shape`` (shared-engine form).
-    - ``layout=Layout(strides=None)`` (sugar), high → low level → dest
-      ``strides[k]=0`` for every Split axis ``k``; non-Split axes follow C-order
-      over ``shard_layout_local_shape(layout)`` with size-1 → 0 (per-instance).
-    - ``layout=Layout(strides=tuple)`` (verbose) → dest strides taken verbatim;
-      typeinfer MUST NOT rewrite (e.g. SM80 MMA fragment layouts).
-
-    Cross-CTA fence. The grid fence for a cross-CTA reshard is owned by the
-    reshard lowering, not a separately authored sync. When a reshard reads a
-    gmem shard produced under a different CTA ownership (an ownership change
-    across a cta mesh), the naive lowering is sync-then-reshard: a grid barrier
-    is emitted before the reshard so every CTA's prior shard writes are visible.
-    This is a scenario-dispatch point — the naive path always fences; a future
-    path may skip the fence when it can prove visibility. The naive path owns
-    only the fence; cross-CTA data redistribution (all-to-all / gather across
-    CTAs) is not implemented here and belongs to a future scenario.
-    """
+    """Convert *x* to a target layout / storage in place, preserving the logical shape."""
     x = ParamDef(kind="input", pattern=Tensor)
     layout = ParamDef(kind="attribute", annotation=ShardLayout, default=None)
     storage = ParamDef(kind="attribute", default=None)
 
 @register_typeinfer(Reshard)
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
-    """`reshard` swaps layout / storage but **preserves the logical
-    ``TensorType.shape``** of the input.
-
-    storage-agnostic: when the input ShardLayout uses sugar-default
-    C-order strides AND has at least one ``Split`` attr, the strides
-    are rewritten to the per-instance default form (Split axes → 0,
-    non-Split axes C-order over local shape with size-1 → 0). Explicit
-    user-provided cute strides (non-C-order, e.g. SM80 mma fragments)
-    are preserved verbatim.
-
-    Resolution:
-    - Output shape always equals the input shape ``x_ty.shape``.
-    - ``layout`` MUST be a ``ShardLayout`` when supplied; otherwise
-      ``x.layout`` is preserved.
-    - When ``storage`` is unspecified (``None``), ``x.storage`` is preserved.
-
-    Logical-shape / local-memory rearrangement (transpose / flatten /
-    true reshape) is **not** in scope — use :class:`Reshape`.
-    """
     if not call.args:
         raise TypeError("Reshard: missing required input 'x'")
     x_ty = ctx.type_of(call.args[0])
@@ -236,14 +169,6 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     if op.layout is not None and not isinstance(op.layout, ShardLayout):
         ctx.error(call, "Reshard.layout must be a ShardLayout (or None to preserve)")
     storage_changed = op.storage is not None and op.storage != x_ty.storage
-    # Spec docs/spec/hir.md §2.5 decision table:
-    # - layout=None + storage unchanged: no-op (preserve src type).
-    # - layout=None + storage changed: error (must give explicit layout).
-    # - layout=sugar (strides=None) + storage unchanged: same-storage
-    #   materialization (match src.layout form; plain → shared C-order).
-    # - layout=sugar (strides=None) + storage changed: direction rule
-    #   (low → high ⇒ shared C-order; high → low ⇒ per-instance).
-    # - layout=verbose (strides=tuple): respect verbatim.
     if op.layout is None:
         if storage_changed:
             ctx.error(

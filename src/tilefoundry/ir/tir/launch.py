@@ -1,18 +1,4 @@
-"""``tir.Launch`` — host-side device-kernel launch effect Op.
-
-A host launch is the effect Op ``Launch`` invoked through ``Evaluate``:
-
-    Evaluate(Launch(cluster, dynamic_smem, stream, attrs),
-             (SymbolRef(callee), grid_x, grid_y, grid_z,
-              block_x, block_y, block_z, *forwarded_args))
-
-The callee and the grid / block extents flow through the ``Evaluate`` args;
-the Op attributes carry the non-grid/block launch configuration. Grid / block
-extents are normal Exprs — a ``Constant`` for a static extent, a ``ShapeOf``
-for a launch-provided (dynamic) one, or a dim-arithmetic ``Call`` over those.
-
-Spec: tir.md §3.6
-"""
+"""``tir.Launch`` — host-side device-kernel launch effect Op."""
 from __future__ import annotations
 
 from tilefoundry.ir.core.op import Op
@@ -21,31 +7,7 @@ from tilefoundry.ir.target.launch import LaunchAttrs
 
 
 class Launch(Op):
-    """Host launch of a device kernel — an effect Op producing no value.
-
-    Spec: tir.md §3.6
-
-    Appears only in a CPU (host) entry body as ``Evaluate(Launch(...), args)``
-    with ``args = (SymbolRef(callee), grid_x, grid_y, grid_z, block_x, block_y,
-    block_z, *forwarded_args)``.
-
-    - callee: ``args[0]`` MUST be a ``SymbolRef`` resolving to a device
-      ``PrimFunction`` with a CUDA target.
-    - grid / block: ``args[1:7]`` are the grid then block extents in the fixed
-      order ``grid_x, grid_y, grid_z, block_x, block_y, block_z``; each is an
-      ``Expr`` (``Constant`` for static, a computed dim ``Expr`` for dynamic).
-      They are launch config, not kernel params — the device observes geometry
-      through ``gridDim`` / ``blockIdx`` and the codegen ``program_dim`` /
-      ``program_shape`` accessors.
-    - forwarded args: the remaining ``args`` bind the callee's host-visible
-      parameters in declaration order; they MUST NOT include the hidden
-      shape-scalar parameters (the host fills those from a tensor's runtime
-      shape).
-    - attributes: ``cluster`` / ``dynamic_smem`` / ``stream`` / ``attrs`` carry
-      the non-grid/block launch config; a ``cluster`` / ``stream`` / ``attrs``
-      value the current CUDA target does not support MUST be rejected in target
-      lowering.
-    """
+    """Host launch of a device kernel — an effect Op producing no value."""
 
     cluster = ParamDef(kind="attribute", default=None)
     dynamic_smem = ParamDef(kind="attribute", default=0)

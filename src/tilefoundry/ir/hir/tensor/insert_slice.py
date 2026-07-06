@@ -1,7 +1,4 @@
-"""HIR insert_slice op (dynamic-update-slice).
-
-Spec: hir.md §2.2
-"""
+"""HIR insert_slice op (dynamic-update-slice)."""
 from __future__ import annotations
 
 from tilefoundry.evaluator.registry import register_eval
@@ -16,32 +13,7 @@ from tilefoundry.ir.types import DType, TensorType
 
 @register_op(name="insert_slice")
 class InsertSlice(Op):
-    """Dynamic-update-slice: returns ``dst`` with ``update`` written into the
-    window starting at ``offsets``.
-
-    Spec: hir.md §2.2
-
-    Returns ``dst`` with ``update`` written into the window that starts at
-    ``offsets`` (one start per dim) and spans ``update``'s shape — the SSA
-    spelling of "slice + store", kept distinct from ``scatter``
-    (data-dependent multi-index). Contract:
-
-    1. ``update`` MUST have the same rank as ``dst``, and the same dtype.
-    2. ``offsets`` gives one start per sliced dim. The 1-D case (the only
-       implemented rank) takes a single scalar start: a rank-0 ``()`` integer
-       tensor for a runtime value, or a compile-time integer literal. An N-D
-       slice takes a rank-1 vector of length equal to the number of sliced dims;
-       that rides the same surface and lands with the N-D case.
-    3. ``dst`` / ``update`` are rank-1 — one scalar start, a contiguous window
-       ``[start, start + update.shape[0])``. Higher-rank ``dst`` / ``update``
-       share this surface and are rejected at typeinfer.
-    4. A statically-known window exceeding ``dst``'s extent is rejected by
-       typeinfer; a window resolved only at runtime is checked by the eval /
-       runtime guard.
-
-    The value form returns a new ``dst``; an in-place realization is a lowering
-    concern (the result is anchored on the ``dst`` buffer).
-    """
+    """Dynamic-update-slice: return ``dst`` with ``update`` written into the window at ``offsets``."""
     dst = ParamDef(kind="input", pattern=Tensor)
     update = ParamDef(kind="input", pattern=Tensor)
     offsets = ParamDef(kind="input", pattern=Tensor)

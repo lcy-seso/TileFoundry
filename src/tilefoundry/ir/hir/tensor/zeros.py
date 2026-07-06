@@ -20,10 +20,7 @@ from tilefoundry.ir.types import DType, TensorType
 
 @register_op
 class Zeros(Op):
-    """Allocate a zero-initialised tensor with the given shape / dtype / storage.
-
-    Spec: hir.md §2.2
-    """
+    """Allocate a zero-initialised tensor with the given shape / dtype / storage."""
     shape = ParamDef(kind="attribute", annotation=tuple)
     dtype = ParamDef(kind="attribute", annotation=DType)
     storage = ParamDef(kind="attribute", default=StorageKind.GMEM)

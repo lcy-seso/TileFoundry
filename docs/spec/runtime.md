@@ -406,6 +406,20 @@ Rules:
 - class-style public surfaces such as `tilefoundry::ReLUOp` are not the
   codegen-facing contract
 
+**Runtime-owned dispatch.** Where an op has more than one implementation tier
+(selected by scope or by operand layout), the runtime exposes exactly **one**
+public entry — never one op per tier. The active tier is derived at **compile
+time** from the operand `ShardLayout`s, together with any codegen-static geometry
+passed as template parameters, through a template trait, and is selected inside
+the entry (`if constexpr`). Codegen emits one uniform call per op and never
+selects a tier, computes a per-tier parameter, or carries the selection on the
+TIR op. `ops::reduce_sharded` ([§3.5](#35-tilefoundryopsreduce_sharded-sharded-reduction))
+derives its reduction level from the operand shard layouts and `ops::sync`
+([§3.4](#34-tilefoundryopssync-mesh-scoped-barrier)) derives its participant
+predicate from the barrier geometry; both are instances of this principle. The
+codegen side is
+[codegen §3.1](./codegen.md#31-runtime-owned-op-dispatch).
+
 ### 3.1 `cute::copy`
 
 ```cpp
@@ -461,37 +475,27 @@ __device__ void sync(unsigned int* grid_bar = nullptr);
 
 The single codegen-facing barrier entry. Codegen passes the barrier `Kind` and
 the codegen-static participant geometry (`Base` thread, `Count`, warp lane
-`Mask`, named-barrier `BarId`) as compile-time template parameters; the runtime
-runs the participant predicate and dispatches to the hardware impl —
-`__syncthreads` (whole CTA), masked `__syncwarp` (a lane subset, under the
-predicate), `bar.sync` (a warp-aligned multi-warp subset, under the predicate),
-or `grid_barrier` (a full `cta`-scope mesh). The grid counter pair is the sole
-runtime argument, used only by the grid kind.
+`Mask`, named-barrier `BarId`) as compile-time template parameters; per the
+runtime-owned dispatch principle ([§3](#3-runtime-ops)) the entry runs the
+participant predicate and selects the hardware barrier for `Kind`: whole CTA,
+a masked lane subset of one warp, a warp-aligned multi-warp named barrier, or a
+grid-wide software barrier over a full `cta`-scope mesh. The grid counter pair
+`grid_bar` is the sole runtime argument, used only by the grid kind.
 
-`grid_barrier` is the grid-kind implementation:
-
-```cpp
-__device__ void grid_barrier(unsigned int* bar);
-```
-
-Semantics:
+Grid-kind guarantees:
 
 - a grid-wide software barrier: every CTA of the launch arrives, and no CTA
   returns until all have arrived
-- `bar` is a two-word gmem counter pair — `bar[0]` the arrival counter, `bar[1]`
-  the release phase — zero-initialized before first use. Each CTA's thread 0
-  arrives once (`atomicAdd(&bar[0], 1)`); the CTA that observes the final arrival
-  resets `bar[0]` and advances `bar[1]`; the others spin on `bar[1]`
+- `grid_bar` is a two-word gmem counter pair — word 0 the arrival counter, word 1
+  the release phase — zero-initialized before first use
 - the counter self-resets each phase and the phase is monotone, so the same
-  `bar` is reusable across successive barriers, relaunches, and CUDA-graph
-  replays
+  counter pair is reusable across successive barriers, relaunches, and
+  CUDA-graph replays
 - gmem writes issued by any CTA before the barrier are visible to every CTA after
-  it returns (arrival `__threadfence` orders them before the release; the spin
-  read acquires the release)
-- the runtime header carries only the helper; each generated module that emits a
-  grid barrier defines its own counter pair with **internal linkage** in the
-  module source, so including the header never introduces a shared or duplicated
-  global symbol across translation units
+  it returns
+- each generated module that emits a grid barrier defines its own counter pair
+  with **internal linkage** in the module source, so including the header never
+  introduces a shared or duplicated global symbol across translation units
 
 Preconditions:
 
@@ -500,47 +504,28 @@ Preconditions:
 - every CTA of the launch executes the barrier (it counts the full `gridDim`)
 - `bar` points at a zero-initialized two-word counter pair reserved for this use
 
-### 3.5 Sharded reduce templates
+### 3.5 `tilefoundry::ops::reduce_sharded` (sharded reduction)
 
 ```cpp
 template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
-__device__ void reduce_sharded(SrcT const&, DstT&, WorkspaceT&);   // entry
-template <class Op, class Axes, class SrcT, class DstT>
-__device__ void reduce(SrcT const& src, DstT& dst);                 // tier-1
-template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
-__device__ void reduce_intra_cta(SrcT const&, DstT&, WorkspaceT&, int wpg);  // tier-2a
-template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
-__device__ void reduce_cross_warp(SrcT const&, DstT&, WorkspaceT&, int wpg); // tier-2b
+__device__ void reduce_sharded(SrcT const& src, DstT& dst, WorkspaceT& workspace);
 ```
 
-`reduce_sharded` is the single codegen-facing entry for a sharded reduce that
-carries a workspace: at compile time it derives the active reduction level and
-its `warps_per_group` from the `(src, dst)` operand `ShardLayout`s and dispatches
-(`if constexpr`) to the matching tier below. The reduced mesh axes are those a
-source `Split` collapses to a `Broadcast` in the reduced destination; the lane
-axes are the rightmost warp-sized (≤ 32) mesh-axis suffix of a `thread`-scoped
-mesh; a reduced lane axis selects the intra-warp-folded tier, otherwise the
-cross-warp-only tier. `warps_per_group` is the product of the reduced non-lane
-mesh extents. The workspace *capacity* is still sized by the lowering.
+The single codegen-facing entry for a sharded reduction of `src` into `dst` under
+combine `Op` over the reduced `Axes`. `Op` is one of the SUM / MEAN / MAX
+combines; MEAN is carried as a SUM plus one final divide by the total reduced
+extent. The reduced mesh axes are those a source `Split` collapses to a
+`Broadcast` in `dst`.
 
-The tiers (chosen by `reduce_sharded`, not codegen):
+`workspace` is optional shared-memory staging: it is used only when the reduction
+crosses warps, and a reduction contained within a warp needs none. Its capacity
+is sized by the lowering and MUST be known at allocation time.
 
-- **tier-1** `reduce` — the reduced axes are covered entirely by the warp's lanes;
-  each thread folds its per-cell slice, then a 32-lane `__shfl_xor_sync` butterfly
-  broadcasts the partial. No workspace.
-- **tier-2a** `reduce_intra_cta` — a reduced axis folds within a warp and the
-  reduction also crosses warps; the lane butterfly runs, then warps combine
-  through a shared-memory workspace of `warps_per_group × n_cells` slots
-  (`n_cells` = the output's per-thread cell count).
-- **tier-2b** `reduce_cross_warp` — the reduction crosses warps only and every
-  lane keeps its own output cells; the lane butterfly is skipped and warps combine
-  through a workspace of `warps_per_group × 32 × n_cells` slots (one per
-  (warp, lane, cell)). Supports the SUM and MAX combines.
-
-`wpg` (`warps_per_group`) is the number of warps whose partials combine into one
-output group. The workspace is shared memory sized by the lowering (it must be
-known at allocation time). A reduction whose reduced axis crosses CTA boundaries
-is not supported (a placeholder `reduce_cross_cta` traps at compile time).
+Per the runtime-owned dispatch principle ([§3](#3-runtime-ops)), the active
+reduction level (intra-warp, cross-warp, cross-CTA) and its warp grouping are
+derived at compile time from the `(src, dst)` operand `ShardLayout`s and selected
+inside the entry; codegen does not choose the level. A reduction whose reduced
+axis crosses CTA boundaries is not supported.
 
 ### 3.6 `tilefoundry::ops::copy_async` (async gmem→smem staging)
 
@@ -574,9 +559,10 @@ the same destination contents as a synchronous `copy`.
 ### 3.7 Wide-load fast path in `copy()`
 
 The shard-aware `copy()` selects a 128-bit vector-load fast path from the
-operands alone — there is no separate entry point and no selection state leaks
-to codegen. It is taken only when all of the following hold, and otherwise the
-copy falls back to the scalar element loop with identical results:
+operands alone, per the runtime-owned dispatch principle
+([§3](#3-runtime-ops)): one `copy()` entry, no codegen-visible selection. It is
+taken only when all of the following hold, and otherwise the copy falls back to
+the scalar element loop with identical results:
 
 - the source is gmem-resident (`cute::is_gmem` on the `ShardTensor` engine);
 - the destination local view is a static, rank-1, contiguous fragment whose

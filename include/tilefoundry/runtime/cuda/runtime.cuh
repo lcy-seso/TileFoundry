@@ -149,12 +149,9 @@ struct ShardTensor {
     // storage when every layout dim is a static CuTe ``Int``.
     TShardLayout shard_layout;
 
-    // Underlying register/memory pointer of the wrapped cute tensor. Mirrors
-    // ``cute::Tensor::data()`` so callers can treat a ShardTensor and a plain
-    // cute tensor uniformly. NOTE: a raw pointer drops the gmem/smem/rmem
-    // residency tag (which lives on the engine *type*), so ``data()`` is only
-    // for sites where residency no longer matters (e.g. the per-thread MMA
-    // register fragment). Residency-aware paths use ``local()`` instead.
+    // Underlying pointer of the wrapped cute tensor (mirrors
+    // ``cute::Tensor::data()``). Drops the residency tag; residency-aware paths
+    // use ``local()``.
     CUTE_HOST_DEVICE auto data() { return engine.data(); }
     CUTE_HOST_DEVICE auto data() const { return engine.data(); }
 };
@@ -183,14 +180,8 @@ CUTE_HOST_DEVICE auto local_impl(ShardTensor<T, GL, SL> const &st,
     return st.engine;
 }
 
-// Slicing case: per spec §2.10, build the per-instance view as
-//   offset = Σ_{m : attrs[m]=Split(k)}  coord[m] · S[k]
-//   shape' = shard_layout_local_shape(sl)
-//   return make_tensor(engine.data() + offset, Layout(shape', S))
-// where ``S`` is the storage-physical strides emitted by typeinfer
-// (spec shard §7.1.2) — consumed verbatim, no per_shard rescale.
-//
-// Spec: docs/spec/runtime.md §2.10
+// Slicing case: build this instance's per-thread view (base offset + local
+// shape) from the shard layout.
 template <class T, class GL, class SL>
 CUTE_HOST_DEVICE auto local_impl(ShardTensor<T, GL, SL> const &st,
                                  std::false_type /*full_broadcast*/) {
@@ -300,7 +291,6 @@ CUTE_HOST_DEVICE auto local_impl(ShardTensor<T, GL, SL> const &st,
 }
 
 // local(st) — dispatches via tag to full-broadcast or slicing impl.
-// Spec: docs/spec/runtime.md §2.10
 template <class T, class GL, class SL>
 CUTE_HOST_DEVICE decltype(auto) local(ShardTensor<T, GL, SL> const &st) {
     // BUGFIX: engine.data() returns a raw pointer (e.g. T*) which cute
@@ -330,8 +320,6 @@ CUTE_HOST_DEVICE decltype(auto) local(ShardTensor<T, GL, SL> const &st) {
 // per-thread fragment (whose engine is only its own slice) must be placed into
 // a shared destination the whole scope writes — e.g. a Split gmem source
 // staged into a full CTA-owned smem tile.
-//
-// Spec: docs/spec/runtime.md §3.6
 template <class T, class GL, class SL>
 CUTE_HOST_DEVICE int local_offset(ShardTensor<T, GL, SL> const &st) {
     using mesh_t = typename SL::mesh;
@@ -401,19 +389,10 @@ CUTE_HOST_DEVICE int local_offset(ShardTensor<T, GL, SL> const &st) {
 
 namespace detail {
 
-// Wide-load fast path folded into ``copy()``: when the destination local view
-// is a static, rank-1, contiguous fragment whose contiguous run is at least
-// 128 bits wide (``cute::max_common_vector`` × ``cute::sizeof_bits``) and the
-// source is a contiguous, 16-byte-aligned gmem run of the same element type,
-// load it as 128-bit vectors into registers and scatter into ``dst``. Every
-// other case — a non-gmem source, a sub-128-bit run, an unaligned or strided
-// source, or the remainder tail — falls back to the element loop with the same
-// elements and values; only the load width changes. The element type is the
-// cute view ``value_type`` (``decltype(dv(0))``), not the ShardTensor engine
-// type; the vector width is derived from CuTe's own vectorization primitive,
-// not a hand-rolled trait.
-//
-// Spec: docs/spec/runtime.md §3.7
+// Wide-load fast path for ``copy()``: load 128-bit vectors into registers when
+// the operands allow it, otherwise fall back to the scalar element loop. The
+// element type is the cute view ``value_type`` (``decltype(dv(0))``) and the
+// vector width comes from CuTe's ``max_common_vector``.
 template <bool SrcIsGmem, class SView, class DView>
 CUTE_HOST_DEVICE void copy_fragment(SView const &sv, DView &dv) {
     using s_val_t = cute::remove_cvref_t<decltype(sv(0))>;
@@ -530,17 +509,9 @@ namespace ops {
 
 // ── Grid-wide barrier ───────────────────────────────────────────────
 
-// Software grid-wide barrier over a caller-provided gmem counter pair:
-// bar[0] = arrival counter, bar[1] = release phase. Every CTA arrives,
-// the last one resets the counter and bumps the phase; the rest spin on
-// the phase. Requires ALL CTAs of the launch to be co-resident (the
-// caller's occupancy contract). Reusable across launches and CUDA-graph
-// replays: the counter self-resets each phase, the phase is monotone
-// (u32 wrap is harmless). Prior gmem writes of every CTA are visible to
-// every CTA after return (__threadfence on arrival orders them before
-// the release; the atomic spin read acquires the release). The backing
-// counter pair is defined per generated module (internal linkage), so a
-// header include never introduces a shared/duplicated global symbol.
+// Software grid-wide barrier over a caller-provided gmem counter pair
+// (word 0 = arrival counter, word 1 = release phase): every CTA arrives, the
+// last resets the counter and bumps the phase, the rest spin on the phase.
 __device__ __forceinline__ void grid_barrier(unsigned int *bar) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -561,15 +532,8 @@ __device__ __forceinline__ void grid_barrier(unsigned int *bar) {
 }
 
 // ── Unified mesh-scoped barrier ─────────────────────────────────────
-//
-// Spec: runtime.md §3.4
-//
-// Codegen emits a single ``sync<Kind, Base, Count, Mask, BarId>(...)`` per
-// barrier; the runtime — not codegen — runs the participant predicate and
-// dispatches to the hardware impl. The participant geometry (base thread,
-// count, warp lane mask, named-barrier id) is passed as compile-time template
-// parameters; the grid counter pair is the sole runtime argument (used only by
-// the grid kind).
+// One ``sync<Kind, ...>`` entry: participant geometry is compile-time, the grid
+// counter pair the sole runtime argument.
 enum class SyncKind {
     syncthreads,     // whole CTA
     syncwarp_full,   // whole block is a single warp
@@ -645,12 +609,8 @@ struct clamp_op {
 
 namespace detail {
 
-// when an op
-// impl receives a ``ShardTensor`` it projects to the per-thread
-// fragment via ``local()`` before reading / writing elements. Plain
-// cute Tensors pass through unchanged. This keeps the
-// shard-tensor-everywhere materialisation invariant from the codegen
-// surface while every helper still operates on a flat cute Tensor.
+// When an op impl receives a ``ShardTensor`` it projects to the per-thread
+// fragment via ``local()``; plain cute Tensors pass through unchanged.
 template <class T> struct is_shard_tensor : std::false_type {};
 template <class E, class GL, class SL>
 struct is_shard_tensor<ShardTensor<E, GL, SL>> : std::true_type {};
@@ -688,20 +648,11 @@ CUTE_HOST_DEVICE void copy_n(TSrc const &src, TDst &dst, int N) {
     }
 }
 
-// Async gmem->smem copy (cp.async.cg): non-blocking producer prefetch. Uses the
-// same per-thread ``to_local`` projection as ``copy_n``, but issues each 16B
-// (128-bit) run through ``cp.async``; consumers order the in-flight group with
-// the ops-level ``cp_async_commit`` / ``cp_async_wait`` fences. A sub-16B tail
-// (or a pre-sm80 target) falls back to a synchronous element write. Same dtype
-// both sides (no cast on the fast path); ``dst`` must be smem and ``src`` gmem
-// — the only direction ``cp.async`` supports. When the dst local view is LARGER
-// than the src fragment (a full CTA-shared smem tile fed by a Split gmem
-// source), each thread stages its fragment at its ``local_offset`` in the tile.
-// The fragment is placed by a FLAT index (``d(off + i)``), so a full staging
-// tile must be a rank-1 / contiguously-coalescing view; both the tile base and
-// each 16B run must be 16-byte aligned for the vector path.
-//
-// Spec: docs/spec/runtime.md §3.6
+// Async gmem->smem copy (cp.async.cg): non-blocking prefetch. Same per-thread
+// ``to_local`` projection as ``copy_n``, but issues each 16B run through
+// ``cp.async`` and falls back to a synchronous element write for the sub-16B
+// tail or a pre-sm80 target. When the dst local view is larger than the src
+// fragment, each thread stages at its ``local_offset`` in the tile.
 template <class TSrc, class TDst>
 CUTE_HOST_DEVICE void copy_async(TSrc const &src, TDst &dst) {
     auto s = detail::to_local(src);
@@ -876,30 +827,9 @@ struct absmax_op {
 };
 
 // ── Sharded reduce ───────────────────────────────
-//
-// ``tilefoundry::ops::reduce<Op, Axes>(src, dst, workspace)`` is the runtime
-// entry point HIR→TIR lowering targets for cross-warp / intra-warp /
-// intra-thread sharded reductions. The
-// dispatch shape is "C++20 concepts + reduce impl pack" — the top-level
-// template inspects ``src``'s ShardTensor type and chooses the correct
-// staged impl:
-//
-//   - LOCAL: every thread folds its own contiguous slice (loop)
-//   - WARP : intra-warp lane fold via ``__shfl_xor_sync`` butterfly
-//   - CTA  : cross-warp fold staged through the shared-memory
-//            ``workspace`` buffer the lowering allocated
-//
-// MEAN is decomposed into ``SUM`` over the staged chain plus a single
-// final division by the total reduce extent so precision loss stays
-// minimal.
-//
-// The scaffold below implements the headline RMSNorm path (full reduce
-// over the trailing axis with mesh axes ``(warp, thread)``). It is
-// intentionally narrow: each thread holds ``LocalCount`` contiguous
-// scalars, intra-warp reduces 32 lanes, cross-warp reduces ``WarpCount``
-// warps via ``workspace``. More general sharding patterns (partial axes,
-// row-stride MEANs, multi-warp groups) are explicit TODOs and will land
-// alongside their first use case.
+// Per-tier reduce building blocks; the public entry ``reduce_sharded`` below
+// selects a tier from the operand shard layouts. MEAN folds as SUM plus a final
+// divide by the total reduced extent.
 
 namespace reduce_impl {
 
@@ -975,16 +905,11 @@ __device__ float cta_sum_via_workspace(float warp_partial,
 } // namespace reduce_impl
 
 // ── Reduce tier-2: cross-warp within a CTA (smem workspace) ───────
-//
-// Selected by the HIR→TIR analysis
-// when the reduce spans warps within a single CTA but does not cross
-// CTAs.  Each warp folds locally then writes its partial into a
-// shared-memory workspace; a single ``__syncthreads()`` later, every
-// thread sums its group's slots and broadcasts the result to every
-// output cell it owns.  ``warps_per_group`` partitions the workspace
-// so non-reduced Split mesh axes form independent reduction groups.
-//
-// MEAN divides by ``local_n × 32 × warps_per_group``.
+// Each warp folds locally then writes its partial into the workspace; after one
+// ``__syncthreads()`` every thread sums its group's slots and broadcasts the
+// result to its output cells. ``warps_per_group`` partitions the workspace into
+// independent reduction groups. MEAN divides by ``local_n × 32 ×
+// warps_per_group``.
 template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
 __device__ inline void reduce_intra_cta(SrcT const &src, DstT &dst,
                                         WorkspaceT &workspace,
@@ -1034,18 +959,15 @@ __device__ inline void reduce_intra_cta(SrcT const &src, DstT &dst,
             d(i) = static_cast<value_type>(cta_partial);
         }
     } else {
-        static_assert(sizeof(Op) == 0, "tilefoundry::ops::reduce: unsupported Op");
+        static_assert(sizeof(Op) == 0,
+                      "tilefoundry::ops::reduce: unsupported Op");
     }
 }
 
 // ── Reduce tier-2b: cross-warp ONLY (lanes independent) ───────────
-//
-// Selected when the reduced Split maps to a non-lane thread-mesh axis
-// (e.g. a per-warp partial merge) while every lane keeps its OWN cells
-// — ``reduce_intra_cta``'s lane butterfly would combine unrelated
-// lanes. Stages one slot per (warp, lane, cell): each thread folds its
-// local cells, writes them, and after one ``__syncthreads`` folds its
-// group's warps for its own lane.
+// Stages one slot per (warp, lane, cell): each thread folds its local cells and
+// writes them, and after one ``__syncthreads`` folds its group's warps for its
+// own lane.
 template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
 __device__ inline void reduce_cross_warp(SrcT const &src, DstT &dst,
                                          WorkspaceT &workspace,
@@ -1098,12 +1020,7 @@ __device__ inline void reduce_cross_warp(SrcT const &src, DstT &dst,
 }
 
 // ── Reduce tier-3: cross-CTA (grid-level) — placeholder ───────────
-//
-// Reserved entry point for reductions
-// whose mesh axes cross CTA boundaries.  No implementation yet — any
-// instantiation traps at compile time, and the HIR→TIR analysis
-// must reject cross-CTA reduce calls explicitly rather than fall
-// back to ``reduce_intra_cta``.
+// No implementation yet; any instantiation traps at compile time.
 template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
 __device__ inline void reduce_cross_cta(SrcT const &, DstT &, WorkspaceT &,
                                         int) {
@@ -1113,22 +1030,8 @@ __device__ inline void reduce_cross_cta(SrcT const &, DstT &, WorkspaceT &,
 }
 
 // ── Layered sharded-reduce dispatch ───────────────────────────────
-//
-// Spec: runtime.md §3.5
-//
-// Codegen emits this single entry for a sharded reduce that carries a
-// workspace; the runtime — not codegen — derives the active reduction
-// level and its ``warps_per_group`` from the (src, dst) operand
-// ShardLayouts:
-//   - reduced mesh axes = those a source ``Split`` turns into a
-//     destination ``Broadcast`` (matched by mesh-axis index);
-//   - lane axes = the rightmost warp-sized (<= 32) suffix of a
-//     ``thread``-scoped mesh;
-//   - if a reduced axis is a lane axis the fold runs the intra-warp
-//     butterfly then combines warps (``reduce_intra_cta``); otherwise
-//     the reduction crosses warps only (``reduce_cross_warp``);
-//   - ``warps_per_group`` = product of the reduced non-lane mesh
-//     extents.
+// Compile-time derivation of the reduction level and ``warps_per_group`` from
+// the operand shard layouts, consumed by ``reduce_sharded`` below.
 template <class T> struct is_split_attr : std::false_type {};
 template <int A> struct is_split_attr<shard::S<A>> : std::true_type {};
 
@@ -1207,21 +1110,13 @@ __device__ inline void reduce_sharded(SrcT const &src, DstT &dst,
 }
 
 // ── Reduce tier-1: intra-warp only, no smem workspace ─────────────
+// Each thread folds its per-cell slice locally, then a 32-lane
+// ``__shfl_xor_sync`` butterfly broadcasts the partial.
 //
-// This entry point is selected by the
-// HIR→TIR analysis when the reduced cute axes are covered entirely
-// by the ``thread`` topology — i.e. no cross-warp coordination is
-// needed.  Each thread folds its per-cell slice locally, then a
-// 32-lane ``__shfl_xor_sync`` butterfly broadcasts the partial.
-//
-// Per-thread cell decomposition: the per-thread cute tensor
-// has ``size(s)`` source elements feeding ``size(d)`` destination
-// cells; we require ``size(s) % size(d) == 0`` and treat the source
-// as ``size(d)`` contiguous chunks of ``size(s) / size(d)`` lanes.
-// Each chunk reduces to one output cell — this matches both the
-// y-residue multi-cell case (size(s)=12, size(d)=3, step=4) and the
-// single-cell rmsnorm case (size(s)=12, size(d)=3 with broadcast or
-// size(s)=N, size(d)=1).
+// Per-thread cell decomposition: the per-thread cute tensor has ``size(s)``
+// source elements feeding ``size(d)`` destination cells; the source is treated
+// as ``size(d)`` contiguous chunks of ``size(s) / size(d)`` lanes, each chunk
+// reducing to one output cell.
 template <class Op, class Axes, class SrcT, class DstT>
 __device__ inline void reduce(SrcT const &src, DstT &dst) {
     auto s = detail::to_local(src);

@@ -1,25 +1,4 @@
-"""Effect-ful TIR Op ``tir.tensor.Reduce``.
-
-Generic reduction Op that dispatches by ``ReduceKind`` tag (``MEAN``
-/ ``SUM``). Writes the reduced result into ``dst``. Wrapped by
-``Evaluate(Reduce, ...)`` in Stmt position.
-
-The Op carries an optional ``workspace`` input — a scratch buffer the
-runtime uses to stage cross-warp partial sums (no hardware
-register-direct exchange across warps exists on Hopper / Ada /
-Ampere; intra-warp uses ``__shfl_xor_sync`` only). The
-``workspace`` argument is **not type/scope-restricted** at the
-IR level — the HIR→TIR lowering picks the appropriate storage
-(rmsnorm uses ``'smem'``); other use cases may pick
-``'gmem'`` or ``'rmem'``. ``workspace`` is omitted (``None``)
-when the reduction stays inside a single warp or the input is
-not mesh-sharded across an inter-warp topology.
-
-CUDA codegen forwards the workspace tensor to
-``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)``;
-the runtime derives the reduction level and its warps_per_group
-from the operand ``ShardLayout``s.
-"""
+"""Effect-form TIR Op ``tir.tensor.Reduce`` — axis reduction dispatched by ``ReduceKind`` tag."""
 
 from __future__ import annotations
 
@@ -35,17 +14,7 @@ __all__ = ["ReduceKind", "Reduce"]
 
 @register_op(dialect="T", category="tensor")
 class Reduce(Op):
-    """Generic reduction op dispatched by ``kind`` tag.
-
-    Spec: tir.md §3.3
-
-    The 3-input form (``workspace`` present) lowers to the runtime
-    ``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)`` entry;
-    the runtime derives the reduction level and its ``warps_per_group`` from the
-    operand ``ShardLayout``s. The op carries no dispatch parameter. ``workspace``
-    is an optional cross-warp staging buffer whose capacity is sized by the
-    lowering; ``None`` when not needed.
-    """
+    """Generic axis reduction; dispatched by the ``kind`` tag."""
     src = ParamDef(kind="input", pattern=Tensor)
     dst = ParamDef(kind="input", pattern=Tensor)
     workspace = ParamDef(

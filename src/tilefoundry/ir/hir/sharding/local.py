@@ -13,15 +13,7 @@ from tilefoundry.ir.types.shard.shard_layout import ShardLayout, Split
 
 @register_op
 class Local(Op):
-    """The current device's local view of a ``ShardLayout`` tensor.
-
-    Spec: hir.md §2.5
-
-    Requires ``x.type.layout`` to be a ``ShardLayout``. The result shape
-    contracts along each ``Split`` axis by that mesh axis's extent; dtype and
-    storage are preserved; the shard wrapper is stripped, leaving the base
-    ``Layout``.
-    """
+    """The current device's local view of a ``ShardLayout`` tensor."""
     x = ParamDef(kind="input", pattern=Tensor)
 @register_typeinfer(Local)
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:

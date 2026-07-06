@@ -17,10 +17,7 @@ from tilefoundry.ir.types import UnitType
 
 @register_op(name="rms_norm")
 class RMSNorm(Op):
-    """RMS normalization writing into ``dst``.
-
-    Spec: tir.md §3.2
-    """
+    """RMS normalization writing into ``dst``."""
     src = ParamDef(kind="input", pattern=Tensor)
     dst = ParamDef(kind="input", pattern=Tensor)
     weight = ParamDef(kind="input", pattern=Tensor)

@@ -5,13 +5,9 @@ Materialises a CuTe tensor bound to the storage class indicated by the
 LetStmt's var TensorType.
 
 When the var's layout is a ``ShardLayout``, the emitted CUDA wraps the per-thread
-backing cute Tensor in ``tilefoundry::make_shard_tensor(...)`` so the
-generated source carries the shard semantics end-to-end. Downstream
-op impls (``tilefoundry::ops::cast`` / ``unary`` / ``binary`` / ``reduce``
-/ ``copy``) take ``ShardTensor`` and convert to per-thread cute via
-``local()`` internally. Non-shard memory storages
-(``gmem`` / ``smem`` / ``rmem``, or ``storage=None``) with no ShardLayout keep
-the prior ``TensorType.shape`` materialisation path.
+backing cute Tensor in ``tilefoundry::make_shard_tensor(...)``. A non-shard
+storage (``gmem`` / ``smem`` / ``rmem``, or ``storage=None``) keeps the plain
+``TensorType.shape`` materialisation path.
 """
 from __future__ import annotations
 

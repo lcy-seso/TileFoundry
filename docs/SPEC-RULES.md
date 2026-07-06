@@ -1,9 +1,21 @@
 # TileFoundry Spec — Rules
 
-How `docs/spec/*.md` is written. Principle first; constraints below.
-No fixed template — pick the form that fits each construct.
+How `docs/spec/*.md` is written, and how spec and code divide responsibility.
+Principle first; constraints below. No fixed template — pick the form that fits
+each construct.
 
 ## Principle
+
+**The spec is the single source of truth for the public surface.** Every
+contract and every long-lived design decision lives in `docs/spec/*.md` and
+nowhere else. Code carries a one-line statement of purpose and comments that
+explain only local mechanics. A later reader — human or agent — learns *what a
+construct promises and why the system is shaped this way* by reading the spec,
+not by reassembling it from docstrings scattered across the source.
+
+There is **no spec↔code cross-validation**. The spec is authoritative; code is
+neither checked against it nor restates it. This keeps a single, clean reading
+entry point and stops the same fact from drifting in two places.
 
 **Simplicity above all.** A spec section reads like a contract, not an
 implementation log. If one sentence is enough, do not write a section.
@@ -11,25 +23,45 @@ implementation log. If one sentence is enough, do not write a section.
 A spec MUST be written in English. Existing zh-CN passages SHOULD be
 rewritten on first touch.
 
+## What the spec owns
+
+The spec is the design document for the **public surface**. It owns exactly
+three kinds of content:
+
+1. **Op contracts** — for each HIR / TIR op, its fields, typing / verifier
+   rules, and the worked examples that pin down otherwise-ambiguous corners.
+2. **Runtime public-function contracts** — the interface a caller depends on
+   for each public runtime entry (what it does and what it guarantees), not its
+   internal helper signatures.
+3. **Cross-function / system design principles** — the invariants and
+   ownership decisions that span constructs (e.g. runtime-owned dispatch,
+   cross-CTA fence ownership) that a reimplementation would still need to honor.
+
+Litmus test: *would a different implementation of the same construct still need
+to know this?* If yes, it is a contract or a design principle and belongs in the
+spec. If it only explains why these particular lines are written this way, it is
+a code comment.
+
+Internal helpers, private utilities, and per-tier implementation signatures are
+**not** part of the public surface and MUST NOT appear in the spec — describe
+the one public entry and the principle by which it dispatches, never the tiers.
+
 ## Op catalog
 
-An **Op** is spec'd as a catalog entry, not a field walk-through:
+An **Op** is spec'd as a catalog entry under a **namespace-leveled heading**
+that mirrors the op's module namespace (e.g. `## tensor` → `### insert_slice`).
+The op name is the pointer: a reader finds the contract by the op's name, and
+code carries no back-link to it.
 
-1. a **namespace-leveled heading** that mirrors the op's module
-   namespace (e.g. `## tensor` → `### insert_slice`)
-2. a **single sentence** naming what the op does; a consensus Op
-   (`add`, `relu`, ...) adds a stable external link instead of prose
+A **custom Op** (its own heading) records its **full contract** in that entry —
+fields, typing / verifier rules, and worked examples. A **consensus Op**
+(`add`, `relu`, `matmul`, ...) needs only a single sentence, or a grouped entry
+with one stable external link covering the group (e.g.
+`#### Reshape / Transpose / … — torch structural ops`); its behavior is defined
+by that external reference, so no local contract is written.
 
-An Op that gets its **own** catalog heading (a custom Op) records its full
-contract — fields, typing / verifier rules, worked examples — in the **Op-class
-docstring** in code, which MUST carry the `Spec: <file> §X.Y` back-link (see
-below). Consensus Ops listed together under a **grouped** entry (one heading +
-an external link covering the whole group, e.g.
-`#### Reshape / Transpose / … — torch structural ops`) are exempt from the
-per-op back-link. Per-op contract or implementation detail MUST NOT live in the
-spec; the spec op catalog is the namespaced index. Design / architecture guidance (dispatch
-principles, cross-layer ownership) stays in the spec prose, outside the
-per-op entries.
+Design / architecture guidance (dispatch principles, cross-layer ownership)
+lives in the spec prose, outside the per-op entries.
 
 ## Section structure
 
@@ -111,30 +143,33 @@ A construct has exactly one owning section. Every other spec
 references it and MUST NOT restate its definition or normative rules:
 a shared fact lives once, at its owner, and is linked — never copied.
 
-Ops follow the Op-catalog rule above: one namespaced heading + one
-sentence in the spec, with the contract in the Op-class docstring.
-Field-by-field tables and `ParamDef` listings stay in code.
-
 For finite enumerations (dtype, storage class, ...) state the rule
 and a representative subset; exhaustive enumeration is not required.
 
 Use **MUST** / **MUST NOT** / **SHOULD** / **MAY** (RFC 2119) only
 inside contract sentences.
 
-## Code-side back references
+## Code side
 
-A code module that implements a spec construct SHOULD carry a single
-docstring line:
+A code module SHOULD open with a **one-line docstring** stating its purpose.
+It MUST NOT restate the spec: no field-by-field contract, no recap of typing
+rules, no design-principle essay. Comments explain **local mechanics only** —
+why these specific lines are written this way — never a construct's contract or
+a system-wide design decision.
 
-```
-Spec: <file> §X.Y
-```
+There is **no per-op `Spec:` back-link** in code. The op / construct name is the
+navigation pointer, and the reverse lookup is `grep` over `docs/spec/`. The spec
+is not validated against code, and code maintains no per-op pointer back to it.
 
-An Op class that has its **own** catalog heading MUST carry this
-`Spec:` line (it is the target of that entry and holds the op's full
-contract); Ops under a grouped consensus entry are exempt (above). The
-reverse index is `grep`. There is no central registry. Internal helpers
-and private utilities MAY omit the anchor.
+### Entropy control
 
-Spec drives plan, not the other way round. When implementation
-reveals that a contract is wrong, the fix lands on the spec first.
+To keep contracts from re-accreting in code, a single-directional lint guards
+the code side (`scripts/spec_entropy_lint.py`): it scans `src/**` docstrings and
+comments for long blocks that carry contract / design vocabulary (`MUST`,
+`MUST NOT`, `SHOULD`, `MAY`, `contract`, `invariant`, `dispatch principle`,
+`single source`, ...) and flags them with "suspected contract — move to spec".
+It inspects code only; it does not read or cross-check the spec. It is a backstop
+for the review gate, not a validator.
+
+Spec drives plan, not the other way round. When implementation reveals that a
+contract is wrong, the fix lands on the spec first.

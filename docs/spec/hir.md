@@ -83,11 +83,12 @@ pure Call DAG.
 ## 2. Op catalog
 
 HIR Ops are organised under `tilefoundry.ir.hir.<namespace>/`; the
-subdirectory is file organisation, not a separate IR layer. Each entry below
-is one sentence; an Op's full contract (fields, typing / verifier rules,
-worked examples) lives in its Op-class docstring, carrying a `Spec: hir.md §2`
-back-link, per [SPEC-RULES](../SPEC-RULES.md). Field signatures and `ParamDef`
-listings stay in code ([core-ir §4](./core-ir.md)).
+subdirectory is file organisation, not a separate IR layer. A **custom Op**
+records its full contract (fields, typing / verifier rules, worked examples)
+in its catalog entry below; a **consensus Op** needs only one sentence or a
+grouped external reference, per [SPEC-RULES](../SPEC-RULES.md). The op name is
+the pointer — code carries no back-link to this catalog. Field signatures and
+`ParamDef` listings stay in code ([core-ir §4](./core-ir.md)).
 
 ### 2.1 `ir/hir/math/`
 
@@ -119,9 +120,71 @@ Allocate a zero-initialised tensor.
 
 #### Reduce
 Axis reduction (`mean` / `sum` / `abs_max` / `max`).
+`Reduce(x, axes=(0,), keepdim=True, kind=ReduceKind.MEAN)` lowers to TIR
+`Reduce`, whose hardware dispatch is derived by codegen + runtime from the
+operand `ShardLayout` / `Mesh`.
+
+- The logical `TensorType.shape` follows numpy: a reduced axis becomes `1`
+  when `keepdim=True`, otherwise it is removed.
+- `storage` MUST be preserved.
+- When `x.type.layout` is plain (non-`ShardLayout`) or `None`, the output
+  layout passes through unchanged.
+
+**Output layout — sharded input.** When `x.type.layout` is a `ShardLayout`,
+reducing over an axis that is `Split` across mesh axes produces a result every
+participant sees identically. The output layout is "project to the local
+layout, then take default strides":
+
+- The input `ShardLayout` MUST be projected to its local layout under the
+  current device's shard view: every cute position bound to a mesh axis via a
+  `Split` attr shrinks to size 1.
+- Every cute position that falls within a reduced tensor axis MUST collapse to
+  size 1.
+- Strides MUST follow the row-major default for the resulting local shape:
+  size-1 positions carry stride `0`; other positions carry the default
+  contiguous stride for the surviving dimension(s).
+- Attrs: every `Split(axis=L)` whose cute position `L` falls within a reduced
+  tensor axis MUST become `Broadcast()`. Non-reduced mesh axes MUST preserve
+  their attr (`Split` / `Partial` / `Broadcast` / `Dynamic`).
+
+The default-contiguous-stride rule applies only when the input `ShardLayout` is
+itself in default-stride form; a non-default-stride (transposed / permuted)
+input MUST carry explicit strides from its producer, else verify / typeinfer
+MUST reject it.
+
+Cute position → tensor axis mapping uses the left-to-right product convention:
+each tensor axis `k` claims as many cute positions as needed to accumulate to
+`tensor_shape[k]`; trailing cute positions attach to the last tensor axis; a
+singleton tensor axis claims exactly one cute position.
+
+Worked examples: rmsnorm `(1, 1536) → (1, 1)` with every mesh axis covering the
+reduced last axis — every cute position ends up size-1-non-reduced (outer axis
+0) or reduced, so the output is `shape=(1,1,1,1) strides=(0,0,0,0)
+attrs=(Broadcast, Broadcast)`. A partial reduce `(M, N) → (M, 1)` with the mesh
+covering only the reduced axis keeps outer axis 0's stride (it still indexes
+distinct rows); only the reduced positions go to size 1 stride 0.
 
 #### insert_slice
-Dynamic-update-slice: return `dst` with `update` written into the window at `offsets`.
+Dynamic-update-slice: return `dst` with `update` written into the window that
+starts at `offsets` (one start per dim) and spans `update`'s shape — the SSA
+spelling of "slice + store", kept distinct from `scatter` (data-dependent
+multi-index).
+
+- `update` MUST have the same rank as `dst`, and the same dtype.
+- `offsets` gives one start per sliced dim. The 1-D case (the only implemented
+  rank) takes a single scalar start: a rank-0 `()` integer tensor for a runtime
+  value, or a compile-time integer literal. An N-D slice takes a rank-1 vector
+  of length equal to the number of sliced dims; that rides the same surface and
+  lands with the N-D case.
+- `dst` / `update` are rank-1 — one scalar start, a contiguous window
+  `[start, start + update.shape[0])`. Higher-rank `dst` / `update` share this
+  surface and MUST be rejected at typeinfer.
+- A statically-known window exceeding `dst`'s extent MUST be rejected by
+  typeinfer; a window resolved only at runtime MUST be checked by the eval /
+  runtime guard.
+
+The value form returns a new `dst`; an in-place realization is a lowering
+concern (the result is anchored on the `dst` buffer).
 
 ### 2.3 `ir/hir/nn/`
 
@@ -153,10 +216,61 @@ Assemble a shape from per-axis dims.
 
 #### Reshard
 Convert `x` to a target layout / storage in place, preserving the logical
-`TensorType.shape`.
+`TensorType.shape`. A single `reshard` covers layout / sharding / storage
+changes plus the logical-shape view shifts that arise from sharding (e.g.
+`(1, 64)` plain → `(1, 8192 @ cta)` sharded on a 128-cta mesh — physically
+each cta still holds 64, logically the `TensorType.shape` is 8192). Local
+memory rearrangement (transpose / flatten / true reshape) is **not** in scope
+— use `Reshape` for that.
+
+- Both attributes are optional: omitting `layout` preserves `x.layout`;
+  omitting `storage` preserves `x.storage`.
+- The output MUST preserve the logical `TensorType.shape` of the input.
+- `layout` MUST be a `ShardLayout` when supplied.
+- Destination `storage` MUST NOT be unmaterialized (`umat`); a reshard targets
+  a concrete residency.
+- The single op covers all four physical kinds (zero-copy view / cross-storage
+  copy / cross-CTA redistribute / mixed); typeinfer + costmodel classify each
+  call from its input ↔ output `TensorType` delta. The IR keeps one node per
+  user call.
+
+**Stride resolution.** Storage direction follows the physical addressability
+hierarchy `rmem < smem < gmem` (per-thread / per-CTA / per-program). Typeinfer
+dispatches on `(layout, storage)`:
+
+- `layout=None`, storage unchanged → `x.type` (no-op).
+- `layout=None`, storage changed → error; a storage change MUST carry an
+  explicit `layout=`.
+- `layout=Layout(strides=None)` (sugar), storage unchanged → dest strides match
+  the form already on `x.layout`: a Split-axes-zero source ⇒ per-instance form;
+  otherwise ⇒ shared-engine C-order over the canonical global shape. When
+  `x.layout` is `None` (plain kernel-param), fall back to shared-engine C-order.
+- `layout=Layout(strides=None)` (sugar), low → high level → dest strides =
+  C-order over `layout.shape` (shared-engine form).
+- `layout=Layout(strides=None)` (sugar), high → low level → dest `strides[k]=0`
+  for every `Split` axis `k`; non-`Split` axes follow C-order over
+  `shard_layout_local_shape(layout)` with size-1 → 0 (per-instance form).
+- `layout=Layout(strides=tuple)` (verbose) → dest strides are taken verbatim;
+  typeinfer MUST NOT rewrite them (e.g. SM80 MMA fragment layouts).
+
+**Cross-CTA fence.** The grid fence for a cross-CTA reshard is owned by the
+reshard lowering, not by a separately authored sync. When a reshard reads a
+gmem shard produced under a different CTA ownership (an ownership change across
+a cta mesh), the lowering MUST emit a grid barrier before the reshard so every
+CTA's prior shard writes are visible. The reshard lowering owns only the fence;
+cross-CTA data redistribution (all-to-all / gather across CTAs) is not part of
+this op.
 
 #### Local
-The current device's local view of a sharded tensor.
+The current device's local view of a `ShardLayout` tensor.
+
+- `x.type.layout` MUST be a `ShardLayout`.
+- The result shape MUST contract along each `Split` axis by that mesh axis's
+  extent; `dtype` and `storage` MUST be preserved.
+- The shard wrapper MUST be stripped, leaving the base `Layout`.
+
+A statically-known `Split` axis size divides by the mesh-axis extent; a
+symbolic axis size is carried through unchanged (folded later).
 
 ## 3. Typing / structural rules
 
@@ -174,7 +288,7 @@ Every constraint below is enforced by the registered
   reachable from a value's type has concrete `layout.strides` (never `None`) —
   the un-materialized (`strides=None`) parser sugar MUST be materialized by the
   owning typeinfer. The per-op `(layout, storage)` resolution table is in the
-  `Reshard` Op docstring (§2.5).
+  `Reshard` catalog entry (§2.5).
 - Any HIR Op MUST be value-form ([core-ir §4](./core-ir.md));
   emitting an effect-form Call into HIR is a verify error.
 

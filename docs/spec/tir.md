@@ -241,8 +241,9 @@ verify and codegen cannot disagree.
 
 Value Ops MUST be anchored by `LetStmt.value` — their result `Var` is the only
 handle. Effect Ops appear in Stmt position as `Evaluate(op, args)`
-([§2.2](#22-evaluate)). Each Op's full contract lives in its Op-class docstring
-(`Spec: tir.md §3`), per [SPEC-RULES](../SPEC-RULES.md).
+([§2.2](#22-evaluate)). Each Op's full contract lives here, in its catalog entry
+below; code carries only a one-line purpose docstring
+([SPEC-RULES](../SPEC-RULES.md)).
 
 ### 3.1 Memory Ops (`tir.memory.*`)
 
@@ -280,7 +281,28 @@ Fused RMS normalisation (effect form).
 ### 3.3 Tensor Ops (`tir.tensor.*`)
 
 #### Reduce
-Axis reduction `dst = reduce(src, axes, kind)` (effect form).
+
+Axis reduction `dst = reduce(src, axes, kind)` (effect form), invoked as
+`Evaluate(Reduce, ...)`.
+
+- `Reduce` dispatches by a `ReduceKind` tag (`MEAN` / `SUM`,
+  [§3.4](#34-generic-kind-tagged-effect-ops-tirarith)) rather than per-kind
+  classes. `kind` MUST be a `ReduceKind`; `axes` is the reduced-axis tuple.
+- Operands are `src`, `dst`, and an **optional** `workspace` input. `Reduce`
+  carries no dispatch parameter — the runtime selects the reduction strategy.
+- `workspace` is a cross-warp staging buffer for partial sums: no hardware
+  register-direct exchange exists across warps on Ampere / Ada / Hopper, so
+  cross-warp partials stage through memory (the intra-warp exchange is
+  `__shfl_xor_sync` only). It MUST be omitted (`None`) when the reduction stays
+  within a single warp or the input is not mesh-sharded across an inter-warp
+  topology; otherwise it MUST be present.
+- `workspace` is **not** type- or scope-restricted at the IR level: the
+  `HirToTirPass` ([passes](./passes.md)) chooses its storage level (RMSNorm
+  uses `smem`; other cases MAY pick `gmem` or `rmem`) and sizes its capacity.
+- The `workspace`-present form lowers to the single runtime entry
+  `reduce_sharded` ([runtime.md](./runtime.md)); the runtime derives the
+  reduction level and its warps-per-group from the operand `ShardLayout`s, not
+  from an op attribute.
 
 ### 3.4 Generic kind-tagged effect Ops (`tir.arith`)
 
@@ -316,6 +338,27 @@ under the function's snake-case name. Parameters MUST be annotated
 Effect Op for a host-side launch of a device kernel (CPU entry only, no value);
 the callee `SymbolRef` and grid/block extents flow through the `Evaluate` args,
 the non-grid/block launch config through the Op attributes.
+
+`Launch` appears only in a CPU (host) entry body, as `Evaluate(Launch(...),
+args)` with `args = (SymbolRef(callee), grid_x, grid_y, grid_z, block_x,
+block_y, block_z, *forwarded_args)`:
+
+- **callee**: `args[0]` MUST be a `SymbolRef` ([§9](#9-symbolref)) resolving to
+  a device `PrimFunction` with a CUDA target.
+- **grid / block**: `args[1:7]` are the grid then block extents in the fixed
+  order `grid_x, grid_y, grid_z, block_x, block_y, block_z`. Each is an `Expr`
+  — a `Constant` for a static extent, a `ShapeOf` ([§7](#7-shapeof)) for a
+  launch-provided (dynamic) one, or a dim-arithmetic `Call` over those. They are
+  launch configuration, not kernel parameters: the device observes geometry
+  through `gridDim` / `blockIdx` (the codegen `program_dim` / `program_shape`
+  accessors), never as arguments.
+- **forwarded args**: the remaining `args` bind the callee's host-visible
+  parameters in declaration order. They MUST NOT include the hidden
+  `<param>_shape_<axis>` scalar parameters ([§7](#7-shapeof)) — the host fills
+  those from a tensor argument's runtime shape.
+- **attributes**: `cluster`, `dynamic_smem`, `stream`, and `attrs` carry the
+  non-grid/block launch configuration. A `cluster` / `stream` / `attrs` value
+  the active CUDA target does not support MUST be rejected in target lowering.
 
 ### 3.7 MMA atom and the hand-written calling convention
 
@@ -465,13 +508,35 @@ Non-blocking `cp.async` gmem→smem staging for warp-specialized pipelines: a
 producer issues copies, groups them, and a consumer waits on the group queue.
 
 #### CopyAsync
-Async gmem→smem copy `cp.async` (effect form; non-blocking).
+
+Async gmem→smem copy `cp.async` (effect form; non-blocking), invoked as
+`Evaluate(CopyAsync, ...)`.
+
+- `CopyAsync` has the same operand shape as `Copy`
+  ([§3.1](#31-memory-ops-tirmemory)) — `source` → `destination` — but the copy
+  is issued asynchronously: it returns before the data lands.
+- `destination` MUST be `smem` and `source` MUST be `gmem` — the only direction
+  `cp.async` supports — and both MUST share a dtype (the copy is a byte copy, no
+  cast).
+- A later read of `destination` MUST be ordered after the copy by a
+  `CpAsyncCommit` followed by a `CpAsyncWait`.
 
 #### CpAsyncCommit
-Close the current in-flight `cp.async` group (fence, no operands).
+
+Close the current in-flight `cp.async` group (fence, no operands), invoked as
+`Evaluate(CpAsyncCommit, ...)`.
+
+- `CpAsyncCommit` snapshots every `CopyAsync` issued since the previous commit
+  into one async group, so a later `CpAsyncWait` can count groups.
 
 #### CpAsyncWait
-Block until all but the `n` newest committed groups have arrived (fence, no operands).
+
+Block until all but the `n` newest committed groups have arrived (fence, no
+operands), invoked as `Evaluate(CpAsyncWait, ...)`.
+
+- `n` MUST be a non-negative compile-time count of the most-recent groups
+  allowed to stay in flight; `n = 0` drains every outstanding group.
+- After the wait, the drained groups' `destination` tensors are safe to read.
 
 ## 4. Verify rules
 

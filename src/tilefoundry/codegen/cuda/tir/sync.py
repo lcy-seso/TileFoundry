@@ -1,18 +1,8 @@
-"""Emitter for the ``tir.Sync`` op — a mesh-scoped barrier.
+"""Emitter for the ``tir.Sync`` op — emits the uniform runtime barrier call.
 
-The barrier kind is derived from the participating thread set (shared with
-verify via ``classify`` / ``participation`` so codegen cannot disagree):
-
-- whole CTA → ``__syncthreads()`` (or ``__syncwarp()`` when the block is one
-  warp);
-- a contiguous lane subset inside one warp → ``__syncwarp(mask)`` guarded by a
-  participant predicate;
-- a warp-aligned contiguous multi-warp subset → ``bar.sync <id>, <count>``
-  guarded by a participant predicate, with ``<id>`` allocated implicitly per
-  kernel.
-
-Non-participant threads never execute the barrier; every participant executes
-the same id/count.
+The barrier kind and participant geometry come from ``classify`` /
+``participation`` (shared with verify); the emit passes them as template
+parameters to ``tilefoundry::ops::sync``.
 """
 from __future__ import annotations
 
@@ -28,14 +18,11 @@ def _emit(call, ctx: CodegenContext) -> None:
     mesh = call.target.mesh
     barrier = classify(mesh)
 
-    # One uniform runtime entry per barrier: the runtime runs the participant
-    # predicate and dispatches to the hardware impl; codegen only passes the
-    # barrier kind and the codegen-static participant geometry as compile-time
-    # template parameters (the grid counter is the sole runtime argument).
+    # Emit the uniform ``sync<Kind, ...>`` entry: the barrier kind and the
+    # codegen-static participant geometry go as template parameters.
     if barrier is SyncBarrier.GRID:
-        # The counter has internal linkage and is defined once per generated
-        # module source (see the module template), so a header include never
-        # introduces a shared/duplicated global symbol across translation units.
+        # The grid counter pair is defined once per module (internal linkage);
+        # see the module template.
         ctx.emit(f"{_SYNC}<{_KIND}::grid>(tilefoundry::tf_grid_bar_state);")
         return
 

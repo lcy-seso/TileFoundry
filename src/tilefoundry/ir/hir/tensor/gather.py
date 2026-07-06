@@ -31,22 +31,12 @@ def _norm_axis(axis: int, rank: int) -> int:
 
 
 def _sliced_shard_layout(x_ty, axis: int, idx_shape: tuple):
-    """Output ``ShardLayout`` for a scalar / single-index gather on a
-    *non-sharded* axis of a sharded input.
-
-    A single-index gather slices the input along ``axis``: a scalar index
-    removes that axis's cute positions, a ``(1,)``-shaped index collapses
-    them to size 1, and the ``Split`` attrs on the surviving positions are
-    remapped onto their new positions. Any form this cannot express as a
-    pure slice — a multi-index gather, a gather along a ``Split`` (sharded)
-    axis, or a composed layout — returns the input layout unchanged.
-    """
+    """Output ``ShardLayout`` for a single-index gather slice; passes the input layout through unchanged when the gather is not a pure slice."""
     sl = x_ty.layout
     if not isinstance(sl, ShardLayout) or not isinstance(sl.layout, Layout):
         return sl
-    # The slice contract covers only a scalar index or a rank-1 one-element
-    # ``(1,)`` index; every other form (including a multi-index whose total
-    # size is 1, e.g. ``(1, 1)``) carries the input layout through unchanged.
+    # Only a scalar index or a rank-1 ``(1,)`` index is a pure slice; any other
+    # form (incl. a total-size-1 multi-index like ``(1, 1)``) passes through.
     scalar_idx = idx_shape == ()
     if not scalar_idx and idx_shape != (1,):
         return sl
@@ -60,8 +50,7 @@ def _sliced_shard_layout(x_ty, axis: int, idx_shape: tuple):
     sliced = {p for p, a in enumerate(pos_to_axis) if a == axis}
     if not sliced:
         return sl
-    # A gather along a ``Split`` (sharded) axis is out of this slice's scope;
-    # keep the input layout unchanged (the historical passthrough).
+    # A gather along a ``Split`` (sharded) axis is not a pure slice; pass through.
     if any(isinstance(a, Split) and a.axis in sliced for a in sl.attrs):
         return sl
     if scalar_idx:
