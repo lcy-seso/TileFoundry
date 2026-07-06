@@ -1,13 +1,12 @@
 #!/usr/bin/env python
-"""Backstop for the spec-authority rule (see docs/SPEC-RULES.md).
+"""Changed-file gate for the spec-authority rule (see docs/SPEC-RULES.md).
 
-Flags a code comment block or docstring that is BOTH long AND carries normative
-vocabulary — a sustained block of such prose in code is a design/behavior
-statement that belongs in the spec. Reads code only, never the spec; a short
-local-mechanics note stays below the length gate.
-
-Usage: ``spec_entropy_lint.py [path ...]`` (defaults to ``src``); prints
-``file:line: message`` per hit and exits non-zero.
+Flags a long docstring or comment block that carries normative vocabulary — a
+sustained block of such prose in code is a design statement that belongs in the
+spec. Reads code only; a short local-mechanics note stays below the length gate.
+The pre-commit hook passes the staged ``src/**`` Python files; this is a
+per-file gate, not a whole-tree one (legacy debt is a separate sweep), so it
+takes explicit paths. Usage: ``spec_entropy_lint.py <path> ...``.
 """
 from __future__ import annotations
 
@@ -114,7 +113,12 @@ def lint_file(path: Path) -> list[tuple[int, str]]:
 
 
 def main(argv: list[str]) -> int:
-    roots = [Path(a) for a in argv] or [Path("src")]
+    if not argv:
+        print("usage: spec_entropy_lint.py <path> ...  "
+              "(pass the files to check; the pre-commit hook passes the "
+              "staged src/**.py files)", file=sys.stderr)
+        return 2
+    roots = [Path(a) for a in argv]
     files: list[Path] = []
     for r in roots:
         files.extend([r] if r.is_file() else sorted(r.rglob("*.py")))

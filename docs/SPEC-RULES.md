@@ -164,12 +164,20 @@ is not validated against code, and code maintains no per-op pointer back to it.
 ### Entropy control
 
 To keep contracts from re-accreting in code, a single-directional lint guards
-the code side (`scripts/spec_entropy_lint.py`): it scans `src/**` docstrings and
-comments for long blocks that carry contract / design vocabulary (`MUST`,
+the code side (`scripts/spec_entropy_lint.py`): it flags a docstring or comment
+block that is both long and carries contract / design vocabulary (`MUST`,
 `MUST NOT`, `SHOULD`, `MAY`, `contract`, `invariant`, `dispatch principle`,
-`single source`, ...) and flags them with "suspected contract — move to spec".
-It inspects code only; it does not read or cross-check the spec. It is a backstop
-for the review gate, not a validator.
+`single source`, ...) with "suspected contract — move to spec". It inspects code
+only; it does not read or cross-check the spec. It is a backstop for the review
+gate, not a validator.
+
+It is a **per-changed-file gate**, not a whole-tree gate. The pre-commit hook
+runs it on the staged Python files under `src/**`, so a file a change touches
+MUST be clean; the tool takes explicit paths and does not scan a default root.
+The repo still carries legacy contract-in-code that predates this rule; clearing
+it is a separate sweep, so a full-tree run is expected to report that backlog
+until the sweep lands. The lint covers Python source only; C++ runtime comments
+under `include/**` are not machine-checked and rely on review.
 
 Spec drives plan, not the other way round. When implementation reveals that a
 contract is wrong, the fix lands on the spec first.
