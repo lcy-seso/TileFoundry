@@ -11,10 +11,29 @@ implementation log. If one sentence is enough, do not write a section.
 A spec MUST be written in English. Existing zh-CN passages SHOULD be
 rewritten on first touch.
 
+## Op catalog
+
+An **Op** is spec'd as a catalog entry, not a field walk-through:
+
+1. a **namespace-leveled heading** that mirrors the op's module
+   namespace (e.g. `## tensor` → `### insert_slice`)
+2. a **single sentence** naming what the op does; a consensus Op
+   (`add`, `relu`, ...) adds a stable external link instead of prose
+
+An Op's full contract — fields, typing / verifier rules, worked
+examples — lives in the **Op-class docstring** in code, which MUST
+carry the `Spec: <file> §X.Y` back-link (see below). Per-op contract or
+implementation detail MUST NOT live in the spec; the spec op catalog is
+the namespaced index. Design / architecture guidance (dispatch
+principles, cross-layer ownership) stays in the spec prose, outside the
+per-op entries.
+
 ## Section structure
 
-A construct that is a `@dataclass` (or has the moral equivalent —
-named fields with stable identity) MUST be introduced as:
+This applies to **non-Op** constructs (e.g. `Function`,
+`GridRegionExpr`, a `TensorType`); Ops follow the Op-catalog rule
+above. A construct that is a `@dataclass` (or has the moral
+equivalent — named fields with stable identity) MUST be introduced as:
 
 1. one short opening sentence — what it is, what role it plays
 2. the `@dataclass` code block as the definition of truth
@@ -89,10 +108,9 @@ A construct has exactly one owning section. Every other spec
 references it and MUST NOT restate its definition or normative rules:
 a shared fact lives once, at its owner, and is linked — never copied.
 
-A consensus Op (`add`, `relu`, ...) is one line plus a stable
-external link. A custom Op spells out responsibility, fields, and
-the verifier-relevant constraints. Field-by-field tables and
-`ParamDef` listings stay in code; the spec records the contract.
+Ops follow the Op-catalog rule above: one namespaced heading + one
+sentence in the spec, with the contract in the Op-class docstring.
+Field-by-field tables and `ParamDef` listings stay in code.
 
 For finite enumerations (dtype, storage class, ...) state the rule
 and a representative subset; exhaustive enumeration is not required.
@@ -109,8 +127,10 @@ docstring line:
 Spec: <file> §X.Y
 ```
 
-The reverse index is `grep`. There is no central registry. Internal
-helpers and private utilities MAY omit the anchor.
+An **Op class** MUST carry this `Spec:` line (it is the target of the
+op-catalog entry, and holds the op's full contract). The reverse index
+is `grep`. There is no central registry. Internal helpers and private
+utilities MAY omit the anchor.
 
 Spec drives plan, not the other way round. When implementation
 reveals that a contract is wrong, the fix lands on the spec first.

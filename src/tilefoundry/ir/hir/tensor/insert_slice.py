@@ -1,16 +1,6 @@
-"""Dynamic-update-slice: ``insert_slice(dst, update, offsets)``.
+"""HIR insert_slice op (dynamic-update-slice).
 
-Returns ``dst`` with ``update`` written into the window that starts at
-``offsets`` (one start per dim) and spans ``update``'s shape — the SSA spelling
-of "slice + store", kept distinct from ``scatter`` (data-dependent multi-index).
-``update`` has the same rank as ``dst``; ``offsets`` is a rank-length ``i32``
-index vector whose entries may be runtime scalars (e.g. a loop induction var).
-The value form returns a new ``dst``; an in-place realization is a lowering
-concern (the result is anchored on the ``dst`` buffer).
-
-Scope: this milestone implements the **1-D** case (rank-1 ``dst`` / ``update``,
-a length-1 ``offsets`` vector). Higher-rank per-dim offsets share this surface
-and are rejected at typeinfer until implemented.
+Spec: hir.md §2.2
 """
 from __future__ import annotations
 
@@ -26,6 +16,30 @@ from tilefoundry.ir.types import DType, TensorType
 
 @register_op(name="insert_slice")
 class InsertSlice(Op):
+    """Dynamic-update-slice: returns ``dst`` with ``update`` written into the
+    window starting at ``offsets``.
+
+    Spec: hir.md §2.2
+
+    Returns ``dst`` with ``update`` written into the window that starts at
+    ``offsets`` (one start per dim) and spans ``update``'s shape — the SSA
+    spelling of "slice + store", kept distinct from ``scatter``
+    (data-dependent multi-index). Contract:
+
+    1. ``update`` MUST have the same rank as ``dst``, and the same dtype.
+    2. ``offsets`` is a rank-1 ``i32`` vector whose length equals ``dst``'s
+       rank — one start per ``dst`` axis; entries MAY be runtime scalars (e.g.
+       a loop induction variable).
+    3. ``dst`` / ``update`` are rank-1 — one start in ``offsets``, a contiguous
+       window ``[offsets[0], offsets[0] + update.shape[0])``. Higher-rank
+       per-dim offsets share this surface and are rejected at typeinfer.
+    4. A statically-known window exceeding ``dst``'s extent is rejected by
+       typeinfer; a window resolved only at runtime is checked by the eval /
+       runtime guard.
+
+    The value form returns a new ``dst``; an in-place realization is a lowering
+    concern (the result is anchored on the ``dst`` buffer).
+    """
     dst = ParamDef(kind="input", pattern=Tensor)
     update = ParamDef(kind="input", pattern=Tensor)
     offsets = ParamDef(kind="input", pattern=Tensor)

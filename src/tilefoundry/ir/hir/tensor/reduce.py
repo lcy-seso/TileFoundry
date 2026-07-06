@@ -1,22 +1,6 @@
 """HIR generic Reduce op with kind enum.
 
-``Reduce(x, axes=(0,), kind=ReduceKind.MEAN)`` lowers to TIR Reduce.
-
-Output layout contract: every ``Split(axis=L)`` ``ShardAttr`` whose
-cute layout position ``L`` falls within a reduced tensor axis is
-replaced by ``Broadcast()`` in the output ``ShardLayout``. The cute
-``Layout`` collapses those positions to ``size = 1`` and
-``stride = 0`` (broadcast view — value is replicated, no
-addressing offset). Non-reduced cute positions preserve their
-original shape and stride unchanged. This matches the principle
-"output cute positions that still index distinct elements
-preserve stride; broadcast positions zero out their stride."
-
-For the rmsnorm demo (``(1, 1536) → (1, 1)``), every cute
-position ends up either size-1-non-reduced (outer tensor axis 0)
-or reduced (the 6/32/8 sub-axes); under the rule above the
-output strides are all zero, matching the expected
-``shape=(1,1,1,1) strides=(0,0,0,0) attrs=(B,B)``.
+Spec: hir.md §2.2
 """
 
 from __future__ import annotations
@@ -45,6 +29,54 @@ __all__ = ["ReduceKind", "Reduce"]
 
 @register_op
 class Reduce(Op):
+    """Axis reduction over ``x`` (``mean`` / ``sum`` / ``abs_max`` / ``max``).
+
+    Spec: hir.md §2.2
+
+    ``Reduce(x, axes=(0,), keepdim=True, kind=ReduceKind.MEAN)`` lowers to TIR
+    ``Reduce`` (whose hardware dispatch is derived by codegen + runtime from the
+    operand ``ShardLayout`` / ``Mesh``).
+
+    Output layout contract. When ``x`` is sharded
+    (``x.type.layout: ShardLayout``), reducing over an axis that is ``Split``
+    across mesh axes produces a result every participant sees identically. The
+    contract is the natural "project to local layout, take default strides":
+
+    1. Project the input ``ShardLayout`` to its local layout under the current
+       device's shard view: every cute position bound to a mesh axis via a
+       ``Split`` attr shrinks to size 1 (the mesh handles per-shard dispatch).
+    2. Reduce the local layout: every cute position that falls within a reduced
+       tensor axis collapses to size 1.
+    3. Strides follow the row-major default for the resulting local shape:
+       size-1 positions carry stride 0; other positions carry the default
+       contiguous stride for the surviving dimension(s).
+    4. Attrs: every ``Split(axis=L)`` whose cute position ``L`` falls within a
+       reduced tensor axis becomes ``Broadcast()``. Non-reduced mesh axes
+       preserve their attr (``Split`` / ``Partial`` / ``Broadcast`` /
+       ``Dynamic``).
+    5. The logical ``TensorType.shape`` follows numpy semantics: a reduced axis
+       becomes 1 when ``keepdim=True``, otherwise it is removed.
+    6. ``storage`` is preserved.
+
+    If ``x.type.layout`` is plain (non-``ShardLayout``) or ``None``, the output
+    layout passes through unchanged. The default-contiguous-stride rule applies
+    only when the input ``ShardLayout`` is itself in default-stride form; a
+    non-default-stride (transposed / permuted) input MUST carry explicit strides
+    from its producer, else verify / typeinfer rejects it.
+
+    Cute position → tensor axis mapping uses the left-to-right product
+    convention: each tensor axis ``k`` claims as many cute positions as needed
+    to accumulate to ``tensor_shape[k]``; trailing cute positions attach to the
+    last tensor axis; a singleton tensor axis claims exactly one cute position.
+
+    Worked examples. rmsnorm ``(1, 1536) → (1, 1)`` with every mesh axis
+    covering the reduced last axis: every cute position ends up
+    size-1-non-reduced (outer axis 0) or reduced, so the output is
+    ``shape=(1,1,1,1) strides=(0,0,0,0) attrs=(Broadcast, Broadcast)``. A
+    partial reduce ``(M, N) → (M, 1)`` with the mesh covering only the reduced
+    axis keeps outer axis 0's stride (it still indexes distinct rows); only the
+    reduced positions go to size 1 stride 0.
+    """
     x = ParamDef(kind="input", pattern=Tensor)
     axes = ParamDef(kind="attribute", annotation=tuple)
     keepdim = ParamDef(kind="attribute", annotation=bool, default=True)
