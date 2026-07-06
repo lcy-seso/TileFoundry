@@ -16,7 +16,8 @@ from tilefoundry.ir.hir.tensor.reduce import Reduce
 from tilefoundry.ir.target.storage import StorageKind
 from tilefoundry.ir.tir.reduce import Reduce as TirReduce
 from tilefoundry.ir.types import DType
-from tilefoundry.ir.types.shard import Topology
+from tilefoundry.ir.types.shard import Mesh, Topology
+from tilefoundry.ir.types.shard.layout import Layout
 from tilefoundry.ir.types.shard.shard_layout import (
     Broadcast,
     Split,
@@ -228,12 +229,30 @@ def test_lane_reduced_defaults_true_without_reduced_mesh_axis():
 
 
 def test_analyze_workspace_reports_lane_reduced_and_sizes():
-    src_a, _ = _case_a_src_dst()
-    ws_a, _wpg_a, _dt_a, lane_a = _analyze_cross_warp_workspace(src_a, (-1,))
-    assert lane_a is True and ws_a > 0        # cross-warp over w, folded per lane
-    src_b, _ = _case_b_src_dst()
-    ws_b, _wpg_b, _dt_b, lane_b = _analyze_cross_warp_workspace(src_b, (0,))
-    assert lane_b is False and ws_b > 0       # cross-warp only over tk
+    # Case A: the reduced axis covers the warp mesh axis w(6) and the lane axis
+    # t; the lane butterfly folds t, and the 6 warps combine → total_warps=6,
+    # warps_per_group=6, lane_reduced.
+    ws_a, wpg_a, _dt_a, lane_a = _analyze_cross_warp_workspace(_case_a_src_dst()[0], (-1,))
+    assert (ws_a, wpg_a, lane_a) == (6, 6, True)
+    # Case B: the reduce crosses the 4 warps only; each lane keeps its own cell →
+    # total_warps=4, warps_per_group=4, not lane_reduced.
+    ws_b, wpg_b, _dt_b, lane_b = _analyze_cross_warp_workspace(_case_b_src_dst()[0], (0,))
+    assert (ws_b, wpg_b, lane_b) == (4, 4, False)
+
+
+def test_analyze_rejects_cross_cta_reduce():
+    # A reduced Split on a cta-topology mesh axis spans CTAs — cross-CTA reduce
+    # is not supported and MUST raise rather than fall back to intra_cta.
+    mesh_cta = Mesh(
+        topology=[Topology("cta", 2), Topology("thread", 32)],
+        layout=Layout(shape=(2, 32), strides=(32, 1)),
+        names=("c", "t"),
+        topologies=(Topology("cta", 2), Topology("thread", 32)),
+    )
+    src = sharded((2, 32), (Split(0), Split(1)), mesh_cta,
+                  cute=(2, 32), strides=(32, 1), dtype=_BF, storage=_RMEM)
+    with pytest.raises(NotImplementedError, match="cross-CTA"):
+        _analyze_cross_warp_workspace(src, (0,))
 
 
 def test_tir_reduce_has_no_cross_warp_only_attribute():

@@ -6,6 +6,8 @@ distinct from ``reduce_intra_cta`` (used when a reduced axis folds within a
 warp, e.g. RMSNorm). Full GPU compile + run + numerical compare.
 """
 
+import re
+
 import torch
 
 import tilefoundry
@@ -46,3 +48,7 @@ def test_cross_warp_sum_emits_reduce_cross_warp() -> None:
     src = emit_cuda_module(group_functions_by_target(lowered)["cuda"]).source
     assert "reduce_cross_warp" in src
     assert "reduce_intra_cta" not in src
+    # Cross-warp staging is per (warp, lane, cell): 4 warps × 32 lanes × 1 cell
+    # = 128 slots, and the group width (warps_per_group) is the 4 reduced warps.
+    assert re.search(r"__shared__ float ws\w*\[128\];", src), src
+    assert re.search(r"reduce_cross_warp<[^(]*>\([^;]*,\s*4\);", src), src
