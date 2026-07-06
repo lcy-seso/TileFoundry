@@ -10,6 +10,12 @@ from tilefoundry.ir.core.pattern import Tensor
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.core.registry import register_typeinfer
 from tilefoundry.ir.types import TensorType
+from tilefoundry.ir.types.shard.layout import Layout
+from tilefoundry.ir.types.shard.shard_layout import (
+    ShardLayout,
+    Split,
+    layout_axis_to_tensor_axis,
+)
 
 
 @register_op
@@ -24,6 +30,67 @@ def _norm_axis(axis: int, rank: int) -> int:
     return a
 
 
+def _sliced_shard_layout(x_ty, axis: int, idx_shape: tuple):
+    """Output ``ShardLayout`` for a scalar / single-index gather on a
+    *non-sharded* axis of a sharded input.
+
+    A single-index gather slices the input along ``axis``: a scalar index
+    removes that axis's cute positions, a ``(1,)``-shaped index collapses
+    them to size 1, and the ``Split`` attrs on the surviving positions are
+    remapped onto their new positions. Any form this cannot express as a
+    pure slice — a multi-index gather, a gather along a ``Split`` (sharded)
+    axis, or a composed layout — returns the input layout unchanged.
+    """
+    sl = x_ty.layout
+    if not isinstance(sl, ShardLayout) or not isinstance(sl.layout, Layout):
+        return sl
+    # Only single-index forms (scalar or one-element idx) are a slice.
+    scalar_idx = idx_shape == ()
+    numel = 1
+    for d in idx_shape:
+        if not isinstance(d, int):
+            return sl
+        numel *= d
+    if not scalar_idx and numel != 1:
+        return sl
+    cute_shape = sl.layout.shape
+    cute_strides = sl.layout.strides
+    if cute_strides is None or len(cute_strides) != len(cute_shape):
+        return sl
+    pos_to_axis = layout_axis_to_tensor_axis(cute_shape, tuple(x_ty.shape))
+    if len(pos_to_axis) != len(cute_shape):
+        return sl
+    sliced = {p for p, a in enumerate(pos_to_axis) if a == axis}
+    if not sliced:
+        return sl
+    # A gather along a ``Split`` (sharded) axis is out of this slice's scope;
+    # keep the input layout unchanged (the historical passthrough).
+    if any(isinstance(a, Split) and a.axis in sliced for a in sl.attrs):
+        return sl
+    if scalar_idx:
+        # Drop the sliced positions; remap Split axes onto the survivors.
+        keep = [p for p in range(len(cute_shape)) if p not in sliced]
+        if not keep:
+            return sl
+        new_shape = tuple(cute_shape[p] for p in keep)
+        new_strides = tuple(cute_strides[p] for p in keep)
+        pos_map = {p: i for i, p in enumerate(keep)}
+        new_attrs = tuple(
+            Split(axis=pos_map[a.axis]) if isinstance(a, Split) else a
+            for a in sl.attrs
+        )
+    else:
+        # (1,)-style index: the axis survives at size 1.
+        new_shape = tuple(1 if p in sliced else d for p, d in enumerate(cute_shape))
+        new_strides = tuple(cute_strides)
+        new_attrs = sl.attrs
+    return ShardLayout(
+        layout=Layout(shape=new_shape, strides=new_strides),
+        attrs=new_attrs,
+        mesh=sl.mesh,
+    )
+
+
 @register_typeinfer(Gather)
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     x_ty = ctx.type_of(call.args[0])
@@ -32,8 +99,9 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     new_shape = list(x_ty.shape)
     # Replace axis-th dim with gathered indices' shape dims (flatten).
     new_shape = new_shape[:axis] + list(idx_ty.shape) + new_shape[axis + 1:]
+    new_layout = _sliced_shard_layout(x_ty, axis, tuple(idx_ty.shape))
     return TensorType(
-        shape=tuple(new_shape), dtype=x_ty.dtype, layout=x_ty.layout, storage=x_ty.storage
+        shape=tuple(new_shape), dtype=x_ty.dtype, layout=new_layout, storage=x_ty.storage
     )
 
 

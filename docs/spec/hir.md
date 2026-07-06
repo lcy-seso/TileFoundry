@@ -235,6 +235,14 @@ operand layout / mesh compatibility it requires and its result layout;
 there is no uniform cross-op rule imposed from outside typeinfer.
 `Reshard` is the explicit op that changes a value's layout / mesh.
 
+A single-index `Gather` (a scalar or one-element index) on a **non-sharded**
+axis is a slice of the sharded input: its result layout drops that axis's cute
+positions (scalar index) or collapses them to size 1 (one-element index) and
+remaps the surviving `Split` cute-axis references onto their new positions,
+carrying the mesh through unchanged. A gather along a sharded (`Split`) axis, a
+multi-index gather, or a composed layout is outside this slice contract and
+carries the input layout through unchanged.
+
 ## 4. `GridRegionExpr`
 
 ```python
