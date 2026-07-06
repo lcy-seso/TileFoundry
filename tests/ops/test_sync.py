@@ -75,11 +75,13 @@ def test_sync_barrier_forms_emit_expected_cuda() -> None:
     lowered = tilefoundry.lower(SyncSquare, target="cuda")
     src = emit_cuda_module(group_functions_by_target(lowered)["cuda"]).source
 
-    assert "__syncthreads();" in src
-    assert "__syncwarp(0xffffffffu)" in src
-    assert "bar.sync" in src
-    assert '"r"(1)' in src and '"r"(2)' in src  # two distinct named ids
-    assert '"r"(64)' in src                      # 64-thread participant count
+    # Codegen emits one uniform sync<Kind, geometry...> entry per barrier; the
+    # participant predicate + hardware impl live in the runtime.
+    assert "SyncKind::syncthreads>();" in src
+    assert "SyncKind::syncwarp_masked, 0, 32, 0xffffffffu>();" in src
+    # Two distinct named-barrier ids (warps 0-1 and 2-3), 64-thread counts.
+    assert "SyncKind::bar_sync, 0, 64, 0u, 1>();" in src
+    assert "SyncKind::bar_sync, 64, 64, 0u, 2>();" in src
 
 
 @module(entry="grid_sync_host")
@@ -103,7 +105,10 @@ def test_grid_scope_sync_emits_grid_barrier() -> None:
 
     lowered = tilefoundry.lower(GridSync, target="cuda")
     src = emit_cuda_module(group_functions_by_target(lowered)["cuda"]).source
-    assert "tilefoundry::ops::grid_barrier(tilefoundry::tf_grid_bar_state);" in src
+    assert (
+        "tilefoundry::ops::sync<tilefoundry::ops::SyncKind::grid>"
+        "(tilefoundry::tf_grid_bar_state);" in src
+    )
     # The backing counter is defined per module with internal linkage, not
     # pulled from a shared header global.
     assert "static __device__ unsigned int tf_grid_bar_state[2];" in src

@@ -451,7 +451,24 @@ Preconditions:
 
 - `tensor.layout()` is a `ShardLayout`
 
-### 3.4 `tilefoundry::ops::grid_barrier`
+### 3.4 `tilefoundry::ops::sync` (mesh-scoped barrier)
+
+```cpp
+template <SyncKind Kind, int Base = 0, int Count = 0, unsigned Mask = 0u,
+          int BarId = 0>
+__device__ void sync(unsigned int* grid_bar = nullptr);
+```
+
+The single codegen-facing barrier entry. Codegen passes the barrier `Kind` and
+the codegen-static participant geometry (`Base` thread, `Count`, warp lane
+`Mask`, named-barrier `BarId`) as compile-time template parameters; the runtime
+runs the participant predicate and dispatches to the hardware impl —
+`__syncthreads` (whole CTA), masked `__syncwarp` (a lane subset, under the
+predicate), `bar.sync` (a warp-aligned multi-warp subset, under the predicate),
+or `grid_barrier` (a full `cta`-scope mesh). The grid counter pair is the sole
+runtime argument, used only by the grid kind.
+
+`grid_barrier` is the grid-kind implementation:
 
 ```cpp
 __device__ void grid_barrier(unsigned int* bar);
@@ -486,6 +503,8 @@ Preconditions:
 ### 3.5 Sharded reduce templates
 
 ```cpp
+template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
+__device__ void reduce_sharded(SrcT const&, DstT&, WorkspaceT&);   // entry
 template <class Op, class Axes, class SrcT, class DstT>
 __device__ void reduce(SrcT const& src, DstT& dst);                 // tier-1
 template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
@@ -494,8 +513,17 @@ template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
 __device__ void reduce_cross_warp(SrcT const&, DstT&, WorkspaceT&, int wpg); // tier-2b
 ```
 
-Three tiers implement a sharded reduce; codegen picks one from the operand
-layouts ([`codegen.md §3.1`](codegen.md)):
+`reduce_sharded` is the single codegen-facing entry for a sharded reduce that
+carries a workspace: at compile time it derives the active reduction level and
+its `warps_per_group` from the `(src, dst)` operand `ShardLayout`s and dispatches
+(`if constexpr`) to the matching tier below. The reduced mesh axes are those a
+source `Split` collapses to a `Broadcast` in the reduced destination; the lane
+axes are the rightmost warp-sized (≤ 32) mesh-axis suffix of a `thread`-scoped
+mesh; a reduced lane axis selects the intra-warp-folded tier, otherwise the
+cross-warp-only tier. `warps_per_group` is the product of the reduced non-lane
+mesh extents. The workspace *capacity* is still sized by the lowering.
+
+The tiers (chosen by `reduce_sharded`, not codegen):
 
 - **tier-1** `reduce` — the reduced axes are covered entirely by the warp's lanes;
   each thread folds its per-cell slice, then a 32-lane `__shfl_xor_sync` butterfly

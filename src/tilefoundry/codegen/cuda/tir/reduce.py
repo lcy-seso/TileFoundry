@@ -13,9 +13,7 @@ from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.ir.tir.reduce import Reduce, ReduceKind
-from tilefoundry.ir.types.shard.shard_layout import Broadcast, ShardLayout, Split
-
-_WARP_SIZE = 32
+from tilefoundry.ir.types.shard.shard_layout import ShardLayout
 
 _REDUCE_TAG = {
     ReduceKind.MEAN: "tilefoundry::ops::mean_op",
@@ -31,47 +29,6 @@ def _axes_pack_typename(axes: tuple) -> str:
     codegen."""
     args = ", ".join(f"cute::Int<{int(a)}>" for a in axes)
     return f"cute::tuple<{args}>"
-
-
-def _lane_reduced(src_ty, dst_ty) -> bool:
-    """Whether the reduction folds an intra-warp (lane) mesh axis, derived from
-    the operand layouts alone.
-
-    The reduced mesh axes are exactly those the HIR Reduce typeinfer collapsed:
-    a ``Split`` in the source that became a ``Broadcast`` in the (reduced)
-    destination, matched by mesh-axis index (both operands share the mesh). The
-    lane axes are the rightmost warp-sized (<= 32) suffix under the ``thread``
-    topology — the lanes a single hardware warp's ``__shfl`` butterfly folds.
-    When a reduced axis is a lane axis the intra-warp path
-    (``reduce_intra_cta``) is correct; otherwise the reduction crosses warps
-    only and ``reduce_cross_warp`` must be used.
-    """
-    src_l = getattr(src_ty, "layout", None)
-    dst_l = getattr(dst_ty, "layout", None)
-    if not isinstance(src_l, ShardLayout) or not isinstance(dst_l, ShardLayout):
-        return True
-    src_attrs, dst_attrs = src_l.attrs, dst_l.attrs
-    reduced = {
-        i
-        for i in range(min(len(src_attrs), len(dst_attrs)))
-        if isinstance(src_attrs[i], Split) and isinstance(dst_attrs[i], Broadcast)
-    }
-    if not reduced:
-        return True
-    mesh_shape = tuple(src_l.mesh.layout.shape)
-    topologies = list(src_l.mesh.topologies)
-    thread_axes = 0
-    if topologies and getattr(topologies[-1], "name", "") == "thread":
-        prod = 1
-        for extent in reversed(mesh_shape):
-            if not isinstance(extent, int):
-                break
-            if prod * extent > _WARP_SIZE:
-                break
-            prod *= extent
-            thread_axes += 1
-    lane_axes = set(range(len(mesh_shape) - thread_axes, len(mesh_shape)))
-    return bool(reduced & lane_axes)
 
 
 @register_codegen_cuda(Reduce)
@@ -96,15 +53,13 @@ def _emit(call, ctx: CodegenContext) -> None:
         axes_t = _axes_pack_typename(call.target.axes)
         if len(call.args) >= 3:
             ws_n = ctx.name_for(call.args[2])
-            wpg = int(call.target.warps_per_group)
-            # tier-2a vs tier-2b is a pure function of the operand layouts: a
-            # reduced lane axis folds within the warp (intra_cta); a reduce that
-            # crosses warps only, with each lane holding its own cells, needs the
-            # cross_warp path.
-            fn = "reduce_intra_cta" if _lane_reduced(src_ty, dst.type) else "reduce_cross_warp"
+            # The runtime derives the reduction level (intra-warp-folded vs
+            # cross-warp-only) and its warps_per_group from the operand
+            # ShardLayouts (see runtime ``reduce_sharded``); codegen emits only
+            # the uniform entry plus the operands.
             ctx.emit(
-                f"tilefoundry::ops::{fn}<{op_tag}, {axes_t}>"
-                f"({src_n}, {dst_n}, {ws_n}, {wpg});"
+                f"tilefoundry::ops::reduce_sharded<{op_tag}, {axes_t}>"
+                f"({src_n}, {dst_n}, {ws_n});"
             )
         else:
             ctx.emit(

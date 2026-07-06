@@ -103,23 +103,17 @@ target group.
   `tilefoundry::` shard tensor for a `ShardLayout` (§7) — it does not change the
   function into a `__device__`-parameter function.
 
-### 3.1 Layout-driven runtime-template selection
+### 3.1 Runtime-owned op dispatch
 
-Where more than one runtime template implements an op, codegen selects among
-them from the operand layouts — the selection is not carried on the TIR op.
-
-For a sharded `Reduce` that needs a cross-warp staging workspace (the 3-operand
-form), the choice between `reduce_intra_cta` and `reduce_cross_warp`
-([`runtime.md §3`](runtime.md)) is a function of the `(src, dst)` `ShardLayout`s:
-
-- the **reduced mesh axes** are those a source `Split` collapses to a `Broadcast`
-  in the reduced destination (matched by mesh-axis index; both operands share the
-  mesh);
-- the **lane axes** are the rightmost warp-sized (≤ 32) mesh-axis suffix under the
-  `thread` topology;
-- if a reduced axis is a lane axis the reduction folds within a warp →
-  `reduce_intra_cta`; otherwise it crosses warps only (each lane keeps its own
-  output cells) → `reduce_cross_warp`.
+Where more than one runtime template implements an op, codegen emits **one
+uniform runtime op call**, passing the operand layouts (and any codegen-static
+participant geometry) as compile-time template parameters; the **runtime op owns
+the scope / layout dispatch** to its implementations. Codegen does not select an
+implementation or compute per-implementation parameters, and the selection is
+not carried on the TIR op. The per-op dispatch contract (e.g. how a sharded
+reduce derives its reduction level and workspace grouping, or how a mesh-scoped
+barrier derives its participant predicate) lives in the runtime
+([`runtime.md §3`](runtime.md)).
 
 ## 4. Codegen products
 

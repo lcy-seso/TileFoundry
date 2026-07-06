@@ -19,7 +19,8 @@ from __future__ import annotations
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.ir.tir.sync import SyncBarrier, Sync, classify, participation
 
-_TID = "tilefoundry::program_id<tilefoundry::TopologyScope::thread>()"
+_SYNC = "tilefoundry::ops::sync"
+_KIND = "tilefoundry::ops::SyncKind"
 
 
 @register_codegen_cuda(Sync)
@@ -27,37 +28,39 @@ def _emit(call, ctx: CodegenContext) -> None:
     mesh = call.target.mesh
     barrier = classify(mesh)
 
+    # One uniform runtime entry per barrier: the runtime runs the participant
+    # predicate and dispatches to the hardware impl; codegen only passes the
+    # barrier kind and the codegen-static participant geometry as compile-time
+    # template parameters (the grid counter is the sole runtime argument).
     if barrier is SyncBarrier.GRID:
-        # Grid-wide software barrier over the module's counter pair. The
-        # counter has internal linkage and is defined once per generated
+        # The counter has internal linkage and is defined once per generated
         # module source (see the module template), so a header include never
         # introduces a shared/duplicated global symbol across translation units.
-        ctx.emit("tilefoundry::ops::grid_barrier(tilefoundry::tf_grid_bar_state);")
+        ctx.emit(f"{_SYNC}<{_KIND}::grid>(tilefoundry::tf_grid_bar_state);")
         return
 
     p = participation(mesh)
 
     if barrier is SyncBarrier.SYNCTHREADS:
-        ctx.emit("__syncthreads();")
+        ctx.emit(f"{_SYNC}<{_KIND}::syncthreads>();")
         return
 
     if barrier is SyncBarrier.SYNCWARP:
         if p.full_cta:
             # The whole block is a single warp — every lane participates.
-            ctx.emit("__syncwarp();")
+            ctx.emit(f"{_SYNC}<{_KIND}::syncwarp_full>();")
             return
-        # A contiguous lane subset of one warp: only the participant lanes run
-        # the masked warp sync.
+        # A contiguous lane subset of one warp: the runtime predicate keeps
+        # non-participant lanes out of the masked warp sync.
         ctx.emit(
-            f"if ({_TID} >= {p.base} && {_TID} < {p.base + p.count}) "
-            f"__syncwarp(0x{p.lane_mask:08x}u);"
+            f"{_SYNC}<{_KIND}::syncwarp_masked, {p.base}, {p.count}, "
+            f"0x{p.lane_mask:08x}u>();"
         )
         return
 
     # BAR_SYNC: a warp-aligned multi-warp subset uses a named barrier; the
-    # participant predicate keeps non-participants out of it.
+    # runtime participant predicate keeps non-participants out of it.
     bid = ctx.alloc_barrier_id()
     ctx.emit(
-        f"if ({_TID} >= {p.base} && {_TID} < {p.base + p.count}) "
-        f'asm volatile("bar.sync %0, %1;" :: "r"({bid}), "r"({p.count}));'
+        f"{_SYNC}<{_KIND}::bar_sync, {p.base}, {p.count}, 0u, {bid}>();"
     )

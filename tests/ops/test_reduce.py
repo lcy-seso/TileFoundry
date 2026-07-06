@@ -11,7 +11,6 @@ import pytest
 import torch
 
 from tilefoundry.ir.core.kinds import ReduceKind
-from tilefoundry.codegen.cuda.tir.reduce import _lane_reduced
 from tilefoundry.ir.hir.tensor.reduce import Reduce
 from tilefoundry.ir.target.storage import StorageKind
 from tilefoundry.ir.tir.reduce import Reduce as TirReduce
@@ -176,14 +175,16 @@ def test_reduce_max_is_signed_not_abs_max():
     )
 
 
-# ── Cross-warp reduce path selection (codegen-derived, no op attribute) ──────
+# ── Cross-warp reduce path selection (runtime-derived, no op attribute) ──────
 #
 # The runtime has two sharded multi-warp templates: ``reduce_intra_cta`` (lane
 # butterfly + cross-warp combine) and ``reduce_cross_warp`` (cross-warp combine
 # only, each lane keeps its own output cells). Which one applies is a pure
 # function of the operand layouts — a reduced Split on a lane axis vs on a
-# warp-only axis — so codegen derives it from ``(src, dst)`` and the ``Reduce``
-# op carries no selection attribute.
+# warp-only axis. Codegen emits one uniform ``reduce_sharded`` entry; the runtime
+# derives the level and its ``warps_per_group`` from ``(src, dst)`` and the
+# ``Reduce`` op carries no selection attribute. The workspace *capacity* is still
+# sized by the lowering (``_analyze_cross_warp_workspace``).
 
 # rmsnorm-like: reduce the last axis, whose Split covers both the warp (w) and
 # lane (t) mesh axes → a reduced lane axis → intra-cta.
@@ -209,23 +210,6 @@ def _case_b_src_dst():
     dst = sharded((1, 32), (Broadcast(), Split(1)), _MESH_B,
                   cute=(1, 32), strides=(0, 1), dtype=_BF, storage=_RMEM)
     return src, dst
-
-
-def test_lane_reduced_true_when_reduced_axis_is_a_lane_axis():
-    src, dst = _case_a_src_dst()
-    assert _lane_reduced(src, dst) is True
-
-
-def test_lane_reduced_false_when_reduction_crosses_warps_only():
-    src, dst = _case_b_src_dst()
-    assert _lane_reduced(src, dst) is False
-
-
-def test_lane_reduced_defaults_true_without_reduced_mesh_axis():
-    # A non-reduced sharded output (no Split→Broadcast) has no reduced mesh axis;
-    # the intra-cta path is the safe default.
-    src, _ = _case_a_src_dst()
-    assert _lane_reduced(src, src) is True
 
 
 def test_analyze_workspace_reports_lane_reduced_and_sizes():
@@ -256,6 +240,57 @@ def test_analyze_rejects_cross_cta_reduce():
 
 
 def test_tir_reduce_has_no_cross_warp_only_attribute():
-    # The selection is codegen-derived; it MUST NOT leak into the TIR op schema.
+    # The selection is runtime-derived; it MUST NOT leak into the TIR op schema.
     op = TirReduce(axes=(-1,), kind=ReduceKind.SUM, warps_per_group=2)
     assert not hasattr(op, "cross_warp_only")
+
+
+# ── Cross-warp reduce end-to-end (folded from the former e2e file) ───────────
+#
+# A warp-only reduction (each lane keeps its own output cell) drives the runtime
+# ``reduce_cross_warp`` path via the uniform ``reduce_sharded`` entry. Full GPU
+# compile + run + numeric compare, plus the codegen-emit shape.
+import tilefoundry  # noqa: E402
+from tilefoundry import func as _func, module as _module  # noqa: E402
+from tilefoundry.dsl import Mesh as _Mesh, Tensor as _Tensor  # noqa: E402
+from tilefoundry.dsl import Topology as _Topo, tf as _tf  # noqa: E402
+
+
+@_module(entry="cross_warp_sum")
+class _CrossWarpSumModule:
+    @_func(topologies=(_Topo("thread", 4 * 32),))
+    def cross_warp_sum(a: _Tensor[(4, 32), 'f32']):
+        with _Mesh(_Topo("thread", 4 * 32), (4, 32), ('tk', 'hc')) as m:
+            # Axis 0 (tk) spans the four warps; axis 1 (hc) is the lane axis and
+            # carries distinct output cells. Reducing axis 0 crosses warps only.
+            a_reg = _tf.reshard(a, (4 @ m.tk, 32 @ m.hc), 'rmem')
+            s = _tf.reduce(a_reg, (0,), True, ReduceKind.SUM)
+            return _tf.reshard(s, (1, 32 @ m.hc), 'gmem')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cross_warp_sum_matches_torch() -> None:
+    rm = tilefoundry.compile(_CrossWarpSumModule, target="cuda")
+    torch.manual_seed(0)
+    x = torch.randn(4, 32, dtype=torch.float32, device="cuda")
+    out = rm(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x.sum(0, keepdim=True), rtol=1e-4, atol=1e-4)
+
+
+def test_cross_warp_sum_emits_reduce_sharded() -> None:
+    # Codegen emits the uniform reduce_sharded entry (no reduce_intra_cta /
+    # reduce_cross_warp call, no warps_per_group argument) — the runtime derives
+    # the level + wpg. The workspace capacity is still sized by the lowering:
+    # per (warp, lane, cell) = 4 warps × 32 lanes × 1 cell = 128 slots.
+    import re  # noqa: PLC0415
+
+    from tilefoundry.codegen.cuda.module import emit_cuda_module  # noqa: PLC0415
+    from tilefoundry.codegen.registry import (  # noqa: PLC0415
+        group_functions_by_target,
+    )
+
+    lowered = tilefoundry.lower(_CrossWarpSumModule, target="cuda")
+    src = emit_cuda_module(group_functions_by_target(lowered)["cuda"]).source
+    assert re.search(r"reduce_sharded<[^(]*>\([^;]*\);", src), src
+    assert re.search(r"__shared__ float ws\w*\[128\];", src), src

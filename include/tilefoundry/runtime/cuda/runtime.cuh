@@ -413,6 +413,46 @@ __device__ __forceinline__ void grid_barrier(unsigned int *bar) {
     __syncthreads();
 }
 
+// ── Unified mesh-scoped barrier ─────────────────────────────────────
+//
+// Spec: runtime.md §3.4
+//
+// Codegen emits a single ``sync<Kind, Base, Count, Mask, BarId>(...)`` per
+// barrier; the runtime — not codegen — runs the participant predicate and
+// dispatches to the hardware impl. The participant geometry (base thread,
+// count, warp lane mask, named-barrier id) is passed as compile-time template
+// parameters; the grid counter pair is the sole runtime argument (used only by
+// the grid kind).
+enum class SyncKind {
+    syncthreads,     // whole CTA
+    syncwarp_full,   // whole block is a single warp
+    syncwarp_masked, // contiguous lane subset of one warp
+    bar_sync,        // warp-aligned multi-warp subset (named barrier)
+    grid,            // grid-wide software barrier over the module counter
+};
+
+template <SyncKind Kind, int Base = 0, int Count = 0, unsigned Mask = 0u,
+          int BarId = 0>
+__device__ inline void sync(unsigned int *grid_bar = nullptr) {
+    if constexpr (Kind == SyncKind::grid) {
+        grid_barrier(grid_bar);
+    } else if constexpr (Kind == SyncKind::syncthreads) {
+        __syncthreads();
+    } else if constexpr (Kind == SyncKind::syncwarp_full) {
+        __syncwarp();
+    } else if constexpr (Kind == SyncKind::syncwarp_masked) {
+        const int tid =
+            int(tilefoundry::program_id<tilefoundry::TopologyScope::thread>());
+        if (tid >= Base && tid < Base + Count)
+            __syncwarp(Mask);
+    } else if constexpr (Kind == SyncKind::bar_sync) {
+        const int tid =
+            int(tilefoundry::program_id<tilefoundry::TopologyScope::thread>());
+        if (tid >= Base && tid < Base + Count)
+            asm volatile("bar.sync %0, %1;" ::"r"(BarId), "r"(Count));
+    }
+}
+
 // ── Op tags (functors for dispatch) ─────────────────────────────────
 
 struct mul_op {
@@ -888,6 +928,100 @@ __device__ inline void reduce_cross_cta(SrcT const &, DstT &, WorkspaceT &,
     static_assert(sizeof(Op) == 0,
                   "tilefoundry::ops::reduce_cross_cta: cross-CTA reduce not "
                   "implemented yet");
+}
+
+// ── Layered sharded-reduce dispatch ───────────────────────────────
+//
+// Spec: runtime.md §3.5
+//
+// Codegen emits this single entry for a sharded reduce that carries a
+// workspace; the runtime — not codegen — derives the active reduction
+// level and its ``warps_per_group`` from the (src, dst) operand
+// ShardLayouts:
+//   - reduced mesh axes = those a source ``Split`` turns into a
+//     destination ``Broadcast`` (matched by mesh-axis index);
+//   - lane axes = the rightmost warp-sized (<= 32) suffix of a
+//     ``thread``-scoped mesh;
+//   - if a reduced axis is a lane axis the fold runs the intra-warp
+//     butterfly then combines warps (``reduce_intra_cta``); otherwise
+//     the reduction crosses warps only (``reduce_cross_warp``);
+//   - ``warps_per_group`` = product of the reduced non-lane mesh
+//     extents.
+template <class T> struct is_split_attr : std::false_type {};
+template <int A> struct is_split_attr<shard::S<A>> : std::true_type {};
+
+struct reduce_dispatch_info {
+    bool lane_reduced;
+    int warps_per_group;
+};
+
+// Derive, from the (src, dst) operand ShardLayouts, the active reduction level
+// and its ``warps_per_group``. Pure compile-time so the caller can select the
+// tier with ``if constexpr`` — otherwise the untaken tier still instantiates
+// and, e.g., ``reduce_cross_warp<mean_op>`` would trip its SUM/MAX-only guard.
+// Requires a static mesh layout (the reduce mesh is a thread-scoped static
+// mesh); a reduced axis on a non-thread mesh scope yields the cross-warp tier.
+template <class SrcSL, class DstSL>
+CUTE_HOST_DEVICE constexpr reduce_dispatch_info reduce_dispatch() {
+    using src_attrs = typename SrcSL::attrs;
+    using dst_attrs = typename DstSL::attrs;
+    using mesh_t = typename SrcSL::mesh;
+    constexpr auto scope = mesh_t::topology::scope;
+    using m_layout_t = typename mesh_t::layout;
+    constexpr int m_rank = cute::tuple_size<src_attrs>::value;
+
+    int m_ext[m_rank] = {};
+    bool reduced[m_rank] = {};
+    auto const m_shape = cute::shape(m_layout_t{});
+    [&]<size_t... Is>(std::index_sequence<Is...>) {
+        ((m_ext[Is] = int(cute::get<Is>(m_shape))), ...);
+        ((reduced[Is] =
+              is_split_attr<cute::remove_cvref_t<decltype(cute::get<Is>(
+                  src_attrs{}))>>::value &&
+              std::is_same_v<
+                  cute::remove_cvref_t<decltype(cute::get<Is>(dst_attrs{}))>,
+                  shard::B>),
+         ...);
+    }(std::make_index_sequence<m_rank>{});
+
+    // Lane axes: rightmost warp-sized suffix of a thread-scoped mesh.
+    int thread_axes = 0;
+    if (scope == TopologyScope::thread) {
+        int prod = 1;
+        for (int i = m_rank - 1; i >= 0; --i) {
+            if (prod * m_ext[i] > 32)
+                break;
+            prod *= m_ext[i];
+            ++thread_axes;
+        }
+    }
+
+    bool lane_reduced = false;
+    int warps_per_group = 1;
+    for (int i = 0; i < m_rank; ++i) {
+        const bool is_lane = (i >= m_rank - thread_axes);
+        if (is_lane) {
+            if (reduced[i])
+                lane_reduced = true;
+            continue;
+        }
+        if (reduced[i])
+            warps_per_group *= m_ext[i];
+    }
+    return {lane_reduced, warps_per_group};
+}
+
+template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
+__device__ inline void reduce_sharded(SrcT const &src, DstT &dst,
+                                      WorkspaceT &workspace) {
+    using SLs = typename cute::remove_cvref_t<SrcT>::shard_layout_type;
+    using SLd = typename cute::remove_cvref_t<DstT>::shard_layout_type;
+    constexpr reduce_dispatch_info info = reduce_dispatch<SLs, SLd>();
+    if constexpr (info.lane_reduced) {
+        reduce_intra_cta<Op, Axes>(src, dst, workspace, info.warps_per_group);
+    } else {
+        reduce_cross_warp<Op, Axes>(src, dst, workspace, info.warps_per_group);
+    }
 }
 
 // ── Reduce tier-1: intra-warp only, no smem workspace ─────────────
