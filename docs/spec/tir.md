@@ -459,6 +459,20 @@ A `T.mma` carrying an `atom` MUST satisfy:
 
 Per-target PTX emission dispatches on the atom ([target](./target.md)).
 
+### 3.8 Async copy Ops (`tir.async.*`)
+
+Non-blocking `cp.async` gmem→smem staging for warp-specialized pipelines: a
+producer issues copies, groups them, and a consumer waits on the group queue.
+
+#### CopyAsync
+Async gmem→smem copy `cp.async` (effect form; non-blocking).
+
+#### CpAsyncCommit
+Close the current in-flight `cp.async` group (fence, no operands).
+
+#### CpAsyncWait
+Block until all but the `n` newest committed groups have arrived (fence, no operands).
+
 ## 4. Verify rules
 
 `tir.verify.verify_prim_function(fn, *, module_fns=())` enforces:

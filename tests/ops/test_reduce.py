@@ -297,4 +297,4 @@ def test_cross_warp_sum_emits_reduce_sharded() -> None:
     lowered = tilefoundry.lower(_CrossWarpSumModule, target="cuda")
     src = emit_cuda_module(group_functions_by_target(lowered)["cuda"]).source
     assert re.search(r"reduce_sharded<[^(]*>\([^;]*\);", src), src
-    assert re.search(r"__shared__ float ws\w*\[128\];", src), src
+    assert re.search(r"__shared__ __align__\(16\) float ws\w*\[128\];", src), src

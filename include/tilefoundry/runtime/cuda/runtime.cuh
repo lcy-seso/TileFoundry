@@ -15,6 +15,7 @@
 #include <cute/arch/mma_sm80.hpp>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <cuda_pipeline.h> // cp.async (__pipeline_memcpy_async)
 
 namespace tilefoundry {
 
@@ -322,6 +323,81 @@ CUTE_HOST_DEVICE decltype(auto) local(ShardTensor<T, GL, SL> const &st) {
         return local_impl(st, std::bool_constant<full_bc>{});
     }
 }
+
+// local_offset(st) — the projection OFFSET of this program instance's fragment
+// within a LARGER destination view, in that view's element strides. Mirrors
+// ``local_impl``'s offset walk without touching the engine: used when a
+// per-thread fragment (whose engine is only its own slice) must be placed into
+// a shared destination the whole scope writes — e.g. a Split gmem source
+// staged into a full CTA-owned smem tile.
+//
+// Spec: docs/spec/runtime.md §3.6
+template <class T, class GL, class SL>
+CUTE_HOST_DEVICE int local_offset(ShardTensor<T, GL, SL> const &st) {
+    using mesh_t = typename SL::mesh;
+    using attrs_t = typename SL::attrs;
+    using sl_layout_t = typename SL::layout;
+    using m_layout_t = typename mesh_t::layout;
+    using topo_t = typename mesh_t::topology;
+    constexpr auto scope = topo_t::scope;
+    using sl_shape_t =
+        cute::remove_cvref_t<decltype(cute::shape(sl_layout_t{}))>;
+    using m_shape_t = cute::remove_cvref_t<decltype(cute::shape(m_layout_t{}))>;
+    constexpr int t_rank = cute::tuple_size<sl_shape_t>::value;
+    constexpr int m_rank = cute::tuple_size<m_shape_t>::value;
+    if constexpr (cute::tuple_size<attrs_t>::value == 0 ||
+                  cute::tuple_size<attrs_t>::value != m_rank) {
+        return 0;
+    } else {
+        auto const &sl_layout = st.shard_layout.layout_value;
+        auto const &m_layout = st.shard_layout.mesh_value.layout_value;
+        auto pid = program_id<scope>();
+        auto crd = m_layout.get_hier_coord(pid);
+        auto const sl_shape = cute::shape(sl_layout);
+        auto const sl_stride = cute::stride(sl_layout);
+        auto const m_shape = cute::shape(m_layout);
+        int g_dim[t_rank];
+        int g_stride[t_rank];
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            ((g_dim[Is] = int(cute::get<Is>(sl_shape)),
+              g_stride[Is] = int(cute::get<Is>(sl_stride))),
+             ...);
+        }(std::make_index_sequence<t_rank>{});
+        int m_ext[m_rank], m_crd[m_rank];
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            ((m_ext[Is] = int(cute::get<Is>(m_shape)),
+              m_crd[Is] = int(cute::get<Is>(crd))),
+             ...);
+        }(std::make_index_sequence<m_rank>{});
+        // For each tensor axis, record which mesh axis (if any) splits it.
+        int axis_to_mesh[t_rank];
+        for (int i = 0; i < t_rank; ++i)
+            axis_to_mesh[i] = -1;
+        [&]<size_t... Is>(std::index_sequence<Is...>) {
+            auto process = [&]<size_t I>(std::integral_constant<size_t, I>) {
+                auto attr = cute::get<I>(attrs_t{});
+                using A = decltype(attr);
+                if constexpr (!std::is_same_v<A, shard::B>) {
+                    constexpr int ax = A::axis;
+                    axis_to_mesh[ax] = int(I);
+                }
+            };
+            (process(std::integral_constant<size_t, Is>{}), ...);
+        }(std::make_index_sequence<m_rank>{});
+        int offset = 0;
+        for (int i = 0; i < t_rank; ++i) {
+            int m = axis_to_mesh[i];
+            if (m >= 0) {
+                // A ShardLayout may carry an ALREADY-LOCALIZED extent
+                // (``g_dim < mesh extent``): the per-instance run is then the
+                // local extent itself, not the global/mesh division.
+                int loc = g_dim[i] >= m_ext[m] ? g_dim[i] / m_ext[m] : g_dim[i];
+                offset += m_crd[m] * loc * g_stride[i];
+            }
+        }
+        return offset;
+    }
+}
 // shard-aware copy — dispatches on ShardTensor vs plain tensor.
 // MVP: full-tensor copy via local() (which currently returns full tensor).
 // TODO: implement per-program slicing in local(); add static_assert
@@ -539,6 +615,41 @@ CUTE_HOST_DEVICE void copy_n(TSrc const &src, TDst &dst, int N) {
     for (int i = 0; i < N; ++i) {
         d(i) = static_cast<value_type>(s(i));
     }
+}
+
+// Async gmem->smem copy (cp.async.cg): non-blocking producer prefetch. Uses the
+// same per-thread ``to_local`` projection as ``copy_n``, but issues each 16B
+// (128-bit) run through ``cp.async``; consumers order the in-flight group with
+// the ops-level ``cp_async_commit`` / ``cp_async_wait`` fences. A sub-16B tail
+// (or a pre-sm80 target) falls back to a synchronous element write. Same dtype
+// both sides (no cast on the fast path); ``dst`` must be smem and ``src`` gmem
+// — the only direction ``cp.async`` supports. When the dst local view is LARGER
+// than the src fragment (a full CTA-shared smem tile fed by a Split gmem
+// source), each thread stages its fragment at its ``local_offset`` in the tile.
+// The fragment is placed by a FLAT index (``d(off + i)``), so a full staging
+// tile must be a rank-1 / contiguously-coalescing view; both the tile base and
+// each 16B run must be 16-byte aligned for the vector path.
+//
+// Spec: docs/spec/runtime.md §3.6
+template <class TSrc, class TDst>
+CUTE_HOST_DEVICE void copy_async(TSrc const &src, TDst &dst) {
+    auto s = detail::to_local(src);
+    auto &&d = detail::to_local(dst);
+    using value_type = cute::remove_cvref_t<decltype(d(0))>;
+    const int n_src = int(cute::size(s));
+    const int n_dst = int(cute::size(d));
+    const int off = (n_dst > n_src) ? local_offset(src) : 0;
+    constexpr int ES = sizeof(value_type);
+    constexpr int C = (ES == 2 || ES == 4 || ES == 8) ? (16 / ES) : 1;
+    int i = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    if (C > 1) {
+        for (; i + C <= n_src; i += C)
+            __pipeline_memcpy_async(&d(off + i), &s(i), C * ES);
+    }
+#endif
+    for (; i < n_src; ++i)
+        d(off + i) = static_cast<value_type>(s(i));
 }
 
 // Unary pointwise: dst(i) = op(src(i))

@@ -541,3 +541,32 @@ The tiers (chosen by `reduce_sharded`, not codegen):
 output group. The workspace is shared memory sized by the lowering (it must be
 known at allocation time). A reduction whose reduced axis crosses CTA boundaries
 is not supported (a placeholder `reduce_cross_cta` traps at compile time).
+
+### 3.6 `tilefoundry::ops::copy_async` (async gmem→smem staging)
+
+```cpp
+template <class TSrc, class TDst>
+__device__ void copy_async(TSrc const& src, TDst& dst);   // cp.async.cg
+```
+
+`copy_async` is the async analogue of `copy_n`: it takes the same per-thread
+`local()` projection of `src` / `dst`, but issues each 16-byte (128-bit) run of
+the fragment as a non-blocking `cp.async` (`C = 16 / sizeof(element)` elements
+per instruction) and falls back to a synchronous element write for the sub-16B
+tail or a pre-sm80 target. `dst` must be shared and `src` global — the only
+direction `cp.async` supports — and both must share an element type (no cast on
+the fast path). When the destination local view is larger than the source
+fragment (a full CTA-shared tile fed by a `Split` global source), each thread
+stages its fragment at its `local_offset(src)` within the tile. The fragment is
+placed by a flat index, so a full staging tile must be a rank-1 /
+contiguously-coalescing view, and both the tile base and each 16-byte run must
+be 16-byte aligned for the vectorized path (`alloc_tensor` aligns shared tiles
+to 16 bytes).
+
+The copy is non-blocking, so a read of `dst` must be ordered after the transfer
+by the two group fences: `cp_async_commit` closes the current in-flight batch
+into one async group (`cp.async.commit_group`), and `cp_async_wait(n)` blocks
+until all but the `n` most-recent committed groups have landed
+(`cp.async.wait_group n`; `n = 0` drains every outstanding group). A
+`copy_async` → `cp_async_commit` → `cp_async_wait(0)` sequence therefore yields
+the same destination contents as a synchronous `copy`.

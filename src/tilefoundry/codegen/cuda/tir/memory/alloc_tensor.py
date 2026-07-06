@@ -61,7 +61,9 @@ def _emit_plain_alloc(
         layout = f"cute::make_layout(cute::Shape<cute::Int<{total}>>{{}})"
     cpp_type = ctx.dtype_to_cpp(var.type.dtype.name)
     if storage == StorageKind.SMEM:
-        ctx.emit(f"__shared__ {cpp_type} {name}_buf[{total}];")
+        # 16B-align the shared tile so a 128-bit vectorized / ``cp.async``
+        # access into it has an aligned base (alignment only ever increases).
+        ctx.emit(f"__shared__ __align__(16) {cpp_type} {name}_buf[{total}];")
         ctx.emit(
             f"auto {name} = cute::make_tensor("
             f"cute::make_smem_ptr({name}_buf), {layout});"
