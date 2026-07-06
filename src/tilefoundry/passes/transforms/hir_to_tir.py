@@ -135,17 +135,22 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
     """Compute the cross-warp staging workspace requirement for a
     sharded ``Reduce``.
 
-    Returns ``(workspace_size, warps_per_group, dtype)``.
+    Returns ``(workspace_size, warps_per_group, dtype, lane_reduced)``.
     ``workspace_size`` = total non-thread mesh positions.
     ``warps_per_group`` = product of non-thread mesh extents on the
     reduced axis (used as MEAN denominator and group width).
     ``workspace_size == 0`` means no workspace needed.
+    ``lane_reduced`` = whether a reduced Split sits on an intra-warp (lane)
+    mesh axis. It distinguishes the cross-warp reduce path: when a workspace is
+    needed and ``lane_reduced`` is false, the reduction crosses warps ONLY (each
+    lane keeps its own cells), so codegen selects ``reduce_cross_warp`` and the
+    staging buffer holds one slot per (warp, lane, cell).
 
     """
 
     layout = getattr(input_ty, "layout", None)
     if not isinstance(layout, ShardLayout):
-        return 0, 0, input_ty.dtype
+        return 0, 0, input_ty.dtype, True
 
     # ``layout.layout.shape`` is the **global** cute layout shape
     # (= filled cute shape under the old convention),
@@ -201,6 +206,7 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
 
     cross_warp = 1
     group_count = 1  # non-reduced Split mesh extent product
+    lane_reduced = False  # a reduced Split on an intra-warp (lane) axis
     for mesh_axis_idx, attr in enumerate(layout.attrs):
         if not isinstance(attr, Split):
             continue
@@ -211,6 +217,8 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
         # Thread axis? (rightmost thread_axes in mesh)
         is_thread = mesh_axis_idx >= len(mesh_shape) - thread_axes
         if is_thread:
+            if on_reduced:
+                lane_reduced = True
             continue
         if on_reduced and mesh_axis_idx in cta_topo_axes:
             raise NotImplementedError(
@@ -230,8 +238,12 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
     # each "group" is one warp — so skip the smem workspace and emit
     # the intra-warp tier-1 path (``reduce(src, dst)`` overload).
     if total_warps <= 1 or cross_warp <= 1:
-        return 0, 0, input_ty.dtype
-    return total_warps, cross_warp, input_ty.dtype
+        return 0, 0, input_ty.dtype, True
+    # ``lane_reduced=False`` means the reduction crosses warps ONLY — every lane
+    # keeps its own independent cells (the intra_cta butterfly would sum
+    # unrelated lanes). Codegen must emit reduce_cross_warp, whose workspace
+    # stages per (warp, lane, cell): x32 slots.
+    return total_warps, cross_warp, input_ty.dtype, lane_reduced
 
 
 @dataclass(frozen=True)
@@ -761,10 +773,21 @@ class _Lowerer:
         # may be the per-shard local form ``(1, 1, 1, 8)``; using
         # that would silently mis-map ``axes=(-1,)`` to a non-Split
         # cute position and skip the workspace alloc.
-        ws_size, warps_per_group, ws_dtype = _analyze_cross_warp_workspace(
-            expr.args[0].type, axes
+        ws_size, warps_per_group, ws_dtype, lane_reduced = (
+            _analyze_cross_warp_workspace(expr.args[0].type, axes)
         )
         if ws_size > 0:
+            # The runtime stages one warp-partial PER OUTPUT CELL: scale the
+            # workspace by the output's per-thread cell count (1 for scalar
+            # reduces — the historical size).
+            n_cells = 1
+            for dim in r.type.shape:
+                if isinstance(dim, int):
+                    n_cells *= dim
+            ws_size *= max(1, n_cells)
+            if not lane_reduced:
+                # cross-warp-only: per (warp, lane, cell) staging slots.
+                ws_size *= 32
             ws_type = TensorType(
                 shape=(ws_size,),
                 dtype=ws_dtype,

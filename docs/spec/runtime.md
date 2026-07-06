@@ -482,3 +482,34 @@ Preconditions:
   a launch whose CTAs are not all resident deadlocks
 - every CTA of the launch executes the barrier (it counts the full `gridDim`)
 - `bar` points at a zero-initialized two-word counter pair reserved for this use
+
+### 3.5 Sharded reduce templates
+
+```cpp
+template <class Op, class Axes, class SrcT, class DstT>
+__device__ void reduce(SrcT const& src, DstT& dst);                 // tier-1
+template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
+__device__ void reduce_intra_cta(SrcT const&, DstT&, WorkspaceT&, int wpg);  // tier-2a
+template <class Op, class Axes, class SrcT, class DstT, class WorkspaceT>
+__device__ void reduce_cross_warp(SrcT const&, DstT&, WorkspaceT&, int wpg); // tier-2b
+```
+
+Three tiers implement a sharded reduce; codegen picks one from the operand
+layouts ([`codegen.md §3.1`](codegen.md)):
+
+- **tier-1** `reduce` — the reduced axes are covered entirely by the warp's lanes;
+  each thread folds its per-cell slice, then a 32-lane `__shfl_xor_sync` butterfly
+  broadcasts the partial. No workspace.
+- **tier-2a** `reduce_intra_cta` — a reduced axis folds within a warp and the
+  reduction also crosses warps; the lane butterfly runs, then warps combine
+  through a shared-memory workspace of `warps_per_group × n_cells` slots
+  (`n_cells` = the output's per-thread cell count).
+- **tier-2b** `reduce_cross_warp` — the reduction crosses warps only and every
+  lane keeps its own output cells; the lane butterfly is skipped and warps combine
+  through a workspace of `warps_per_group × 32 × n_cells` slots (one per
+  (warp, lane, cell)). Supports the SUM and MAX combines.
+
+`wpg` (`warps_per_group`) is the number of warps whose partials combine into one
+output group. The workspace is shared memory sized by the lowering (it must be
+known at allocation time). A reduction whose reduced axis crosses CTA boundaries
+is not supported (a placeholder `reduce_cross_cta` traps at compile time).

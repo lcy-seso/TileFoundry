@@ -103,6 +103,24 @@ target group.
   `tilefoundry::` shard tensor for a `ShardLayout` (§7) — it does not change the
   function into a `__device__`-parameter function.
 
+### 3.1 Layout-driven runtime-template selection
+
+Where more than one runtime template implements an op, codegen selects among
+them from the operand layouts — the selection is not carried on the TIR op.
+
+For a sharded `Reduce` that needs a cross-warp staging workspace (the 3-operand
+form), the choice between `reduce_intra_cta` and `reduce_cross_warp`
+([`runtime.md §3`](runtime.md)) is a function of the `(src, dst)` `ShardLayout`s:
+
+- the **reduced mesh axes** are those a source `Split` collapses to a `Broadcast`
+  in the reduced destination (matched by mesh-axis index; both operands share the
+  mesh);
+- the **lane axes** are the rightmost warp-sized (≤ 32) mesh-axis suffix under the
+  `thread` topology;
+- if a reduced axis is a lane axis the reduction folds within a warp →
+  `reduce_intra_cta`; otherwise it crosses warps only (each lane keeps its own
+  output cells) → `reduce_cross_warp`.
+
 ## 4. Codegen products
 
 ### 4.1 `LinkableFunction`

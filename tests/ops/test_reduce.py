@@ -11,14 +11,18 @@ import pytest
 import torch
 
 from tilefoundry.ir.core.kinds import ReduceKind
+from tilefoundry.codegen.cuda.tir.reduce import _lane_reduced
 from tilefoundry.ir.hir.tensor.reduce import Reduce
 from tilefoundry.ir.target.storage import StorageKind
+from tilefoundry.ir.tir.reduce import Reduce as TirReduce
 from tilefoundry.ir.types import DType
+from tilefoundry.ir.types.shard import Topology
 from tilefoundry.ir.types.shard.shard_layout import (
     Broadcast,
     Split,
     layout_axis_to_tensor_axis,
 )
+from tilefoundry.passes.transforms.hir_to_tir import _analyze_cross_warp_workspace
 from tests.ops.eval_utils import EvalCase, run_eval_case
 from tests.ops.typeinfer_utils import (
     TypeInferCase,
@@ -169,3 +173,70 @@ def test_reduce_max_is_signed_not_abs_max():
         EvalCase("", Reduce(axes=(-1,), keepdim=True, kind=ReduceKind.ABS_MAX),
                  (x,), torch.tensor([[5.0]]), atol=0.0)
     )
+
+
+# ── Cross-warp reduce path selection (codegen-derived, no op attribute) ──────
+#
+# The runtime has two sharded multi-warp templates: ``reduce_intra_cta`` (lane
+# butterfly + cross-warp combine) and ``reduce_cross_warp`` (cross-warp combine
+# only, each lane keeps its own output cells). Which one applies is a pure
+# function of the operand layouts — a reduced Split on a lane axis vs on a
+# warp-only axis — so codegen derives it from ``(src, dst)`` and the ``Reduce``
+# op carries no selection attribute.
+
+# rmsnorm-like: reduce the last axis, whose Split covers both the warp (w) and
+# lane (t) mesh axes → a reduced lane axis → intra-cta.
+_THREAD_A = Topology("thread", 6 * 32)
+_MESH_A = mesh((6, 32), ("w", "t"), topology=_THREAD_A)
+# cross-expert-like: reduce the warp axis (tk) only; the lane axis (hc) carries
+# distinct output cells → no reduced lane axis → cross-warp.
+_THREAD_B = Topology("thread", 4 * 32)
+_MESH_B = mesh((4, 32), ("tk", "hc"), topology=_THREAD_B)
+
+
+def _case_a_src_dst():
+    src = sharded((1, 1536), (Split(1), Split(2)), _MESH_A,
+                  cute=(1, 6, 32, 8), strides=(1536, 256, 8, 1), dtype=_BF, storage=_RMEM)
+    dst = sharded((1, 1), (Broadcast(), Broadcast()), _MESH_A,
+                  cute=(1, 1, 1, 1), strides=(0, 0, 0, 0), dtype=_BF, storage=_RMEM)
+    return src, dst
+
+
+def _case_b_src_dst():
+    src = sharded((4, 32), (Split(0), Split(1)), _MESH_B,
+                  cute=(4, 32), strides=(32, 1), dtype=_BF, storage=_RMEM)
+    dst = sharded((1, 32), (Broadcast(), Split(1)), _MESH_B,
+                  cute=(1, 32), strides=(0, 1), dtype=_BF, storage=_RMEM)
+    return src, dst
+
+
+def test_lane_reduced_true_when_reduced_axis_is_a_lane_axis():
+    src, dst = _case_a_src_dst()
+    assert _lane_reduced(src, dst) is True
+
+
+def test_lane_reduced_false_when_reduction_crosses_warps_only():
+    src, dst = _case_b_src_dst()
+    assert _lane_reduced(src, dst) is False
+
+
+def test_lane_reduced_defaults_true_without_reduced_mesh_axis():
+    # A non-reduced sharded output (no Split→Broadcast) has no reduced mesh axis;
+    # the intra-cta path is the safe default.
+    src, _ = _case_a_src_dst()
+    assert _lane_reduced(src, src) is True
+
+
+def test_analyze_workspace_reports_lane_reduced_and_sizes():
+    src_a, _ = _case_a_src_dst()
+    ws_a, _wpg_a, _dt_a, lane_a = _analyze_cross_warp_workspace(src_a, (-1,))
+    assert lane_a is True and ws_a > 0        # cross-warp over w, folded per lane
+    src_b, _ = _case_b_src_dst()
+    ws_b, _wpg_b, _dt_b, lane_b = _analyze_cross_warp_workspace(src_b, (0,))
+    assert lane_b is False and ws_b > 0       # cross-warp only over tk
+
+
+def test_tir_reduce_has_no_cross_warp_only_attribute():
+    # The selection is codegen-derived; it MUST NOT leak into the TIR op schema.
+    op = TirReduce(axes=(-1,), kind=ReduceKind.SUM, warps_per_group=2)
+    assert not hasattr(op, "cross_warp_only")
