@@ -135,22 +135,19 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
     """Compute the cross-warp staging workspace requirement for a
     sharded ``Reduce``.
 
-    Returns ``(workspace_size, warps_per_group, dtype, lane_reduced)``.
-    ``workspace_size`` = total non-thread mesh positions.
-    ``warps_per_group`` = product of non-thread mesh extents on the
-    reduced axis (used as MEAN denominator and group width).
-    ``workspace_size == 0`` means no workspace needed.
-    ``lane_reduced`` = whether a reduced Split sits on an intra-warp (lane)
-    mesh axis. It distinguishes the cross-warp reduce path: when a workspace is
+    Returns ``(workspace_size, dtype, lane_reduced)`` — the values the lowering
+    needs to size the staging buffer. ``workspace_size`` = total non-thread mesh
+    positions; ``0`` means no workspace needed. ``lane_reduced`` = whether a
+    reduced Split sits on an intra-warp (lane) mesh axis: when a workspace is
     needed and ``lane_reduced`` is false, the reduction crosses warps ONLY (each
-    lane keeps its own cells), so codegen selects ``reduce_cross_warp`` and the
-    staging buffer holds one slot per (warp, lane, cell).
-
+    lane keeps its own cells) and the staging buffer holds one slot per
+    (warp, lane, cell). The runtime — not the lowering — derives the reduction
+    tier and its ``warps_per_group`` from the operand layouts.
     """
 
     layout = getattr(input_ty, "layout", None)
     if not isinstance(layout, ShardLayout):
-        return 0, 0, input_ty.dtype, True
+        return 0, input_ty.dtype, True
 
     # ``layout.layout.shape`` is the **global** cute layout shape
     # (= filled cute shape under the old convention),
@@ -187,8 +184,8 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
                 prod *= ext
                 thread_axes += 1
 
-    # Reject cross-CTA reduce explicitly so codegen does not fall back to
-    # ``reduce_intra_cta``. A "cta" topology in ``mesh.topologies`` that
+    # Reject cross-CTA reduce explicitly so the runtime dispatch does not fall
+    # back to a within-CTA tier. A "cta" topology in ``mesh.topologies`` that
     # contributes a reduced Split axis means the reduction spans CTAs and
     # requires the tier-3 ``reduce_cross_cta`` path (not yet implemented).
     cta_topo_axes: set[int] = set()
@@ -238,12 +235,12 @@ def _analyze_cross_warp_workspace(input_ty, reduce_axes):
     # each "group" is one warp — so skip the smem workspace and emit
     # the intra-warp tier-1 path (``reduce(src, dst)`` overload).
     if total_warps <= 1 or cross_warp <= 1:
-        return 0, 0, input_ty.dtype, True
+        return 0, input_ty.dtype, True
     # ``lane_reduced=False`` means the reduction crosses warps ONLY — every lane
-    # keeps its own independent cells (the intra_cta butterfly would sum
-    # unrelated lanes). Codegen must emit reduce_cross_warp, whose workspace
-    # stages per (warp, lane, cell): x32 slots.
-    return total_warps, cross_warp, input_ty.dtype, lane_reduced
+    # keeps its own independent cells. The runtime then selects the cross-warp
+    # tier, whose staging buffer holds one slot per (warp, lane, cell): x32 slots
+    # (sized below by the lowering).
+    return total_warps, input_ty.dtype, lane_reduced
 
 
 @dataclass(frozen=True)
@@ -773,8 +770,8 @@ class _Lowerer:
         # may be the per-shard local form ``(1, 1, 1, 8)``; using
         # that would silently mis-map ``axes=(-1,)`` to a non-Split
         # cute position and skip the workspace alloc.
-        ws_size, warps_per_group, ws_dtype, lane_reduced = (
-            _analyze_cross_warp_workspace(expr.args[0].type, axes)
+        ws_size, ws_dtype, lane_reduced = _analyze_cross_warp_workspace(
+            expr.args[0].type, axes
         )
         if ws_size > 0:
             # The runtime stages one warp-partial PER OUTPUT CELL: scale the
@@ -803,10 +800,7 @@ class _Lowerer:
             self._items.append(_Bind(var=ws, value=alloc_ws))
             tir_args = (x, r, ws)
 
-        reduce_op = TirReduce(
-            axes=axes, kind=target.kind,
-            warps_per_group=warps_per_group if ws_size > 0 else 1,
-        )
+        reduce_op = TirReduce(axes=axes, kind=target.kind)
         self._items.append(_eval_call(reduce_op, tir_args))
         self._cache[key] = r
         return r

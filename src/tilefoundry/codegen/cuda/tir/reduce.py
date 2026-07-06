@@ -1,12 +1,14 @@
 """Codegen for generic Reduce TIR stmt — tag-dispatched.
 
-The 3-arg form ``tilefoundry::ops::reduce<Op, Axes>(src, dst, workspace)``
+The 3-arg form ``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)``
 is the sharded-reduce entry. Forwarded directly when the TIR call
 carries an optional ``workspace`` 3rd input (lowering emitted an
-``AllocTensor(storage=smem)`` for cross-warp staging). The
-2-arg form remains for intra-warp / unsharded reductions; the
-legacy ``reduce_1d`` / ``reduce(M, K, ...)`` rank-aware kernels
-are kept as a fallback for the non-sharded code path.
+``AllocTensor(storage=smem)`` for cross-warp staging); the runtime
+derives the reduction level and its warps_per_group from the operand
+layouts. The 2-arg ``reduce<Op, Axes>(src, dst)`` form remains for
+intra-warp / unsharded reductions; the legacy ``reduce_1d`` /
+``reduce(M, K, ...)`` rank-aware kernels are kept as a fallback for
+the non-sharded code path.
 """
 
 from __future__ import annotations
@@ -41,15 +43,14 @@ def _emit(call, ctx: CodegenContext) -> None:
     is_sharded = isinstance(getattr(src_ty, "layout", None), ShardLayout)
 
     if is_sharded:
-        # Three tier entry points distinguish how the reduce spans the
-        # mesh:
-        #   - tier-1 ``reduce<>(src, dst)``           — intra-warp only
-        #   - tier-2 ``reduce_intra_cta<>(...)``     — cross-warp, intra-CTA
-        #   - tier-3 ``reduce_cross_cta<>(...)``     — cross-CTA (placeholder)
-        # ``_analyze_cross_warp_workspace`` selects tier-1 vs tier-2
-        # by returning ``workspace_size == 0`` (tier-1) or > 0
-        # (tier-2). Tier-3 has no analysis path yet — cross-CTA reduce
-        # is rejected upstream rather than emitted here.
+        # Two codegen-facing entries: the intra-warp ``reduce<>(src, dst)`` when
+        # no workspace is needed, and the workspace-carrying
+        # ``reduce_sharded<>(src, dst, ws)`` otherwise. The lowering
+        # (``_analyze_cross_warp_workspace``) sizes the workspace capacity and
+        # decides which entry applies (``workspace_size == 0`` → 2-arg); the
+        # runtime ``reduce_sharded`` selects the cross-warp tier and its
+        # warps_per_group from the operand layouts. Cross-CTA reduce is rejected
+        # upstream, not emitted here.
         axes_t = _axes_pack_typename(call.target.axes)
         if len(call.args) >= 3:
             ws_n = ctx.name_for(call.args[2])

@@ -213,15 +213,17 @@ def _case_b_src_dst():
 
 
 def test_analyze_workspace_reports_lane_reduced_and_sizes():
+    # The lowering reports only the values it needs to size the staging buffer:
+    # (workspace_size, dtype, lane_reduced). warps_per_group is runtime-derived.
     # Case A: the reduced axis covers the warp mesh axis w(6) and the lane axis
-    # t; the lane butterfly folds t, and the 6 warps combine → total_warps=6,
-    # warps_per_group=6, lane_reduced.
-    ws_a, wpg_a, _dt_a, lane_a = _analyze_cross_warp_workspace(_case_a_src_dst()[0], (-1,))
-    assert (ws_a, wpg_a, lane_a) == (6, 6, True)
+    # t; the lane butterfly folds t, the 6 warps combine → total_warps=6,
+    # lane_reduced.
+    ws_a, _dt_a, lane_a = _analyze_cross_warp_workspace(_case_a_src_dst()[0], (-1,))
+    assert (ws_a, lane_a) == (6, True)
     # Case B: the reduce crosses the 4 warps only; each lane keeps its own cell →
-    # total_warps=4, warps_per_group=4, not lane_reduced.
-    ws_b, wpg_b, _dt_b, lane_b = _analyze_cross_warp_workspace(_case_b_src_dst()[0], (0,))
-    assert (ws_b, wpg_b, lane_b) == (4, 4, False)
+    # total_warps=4, not lane_reduced.
+    ws_b, _dt_b, lane_b = _analyze_cross_warp_workspace(_case_b_src_dst()[0], (0,))
+    assert (ws_b, lane_b) == (4, False)
 
 
 def test_analyze_rejects_cross_cta_reduce():
@@ -239,10 +241,12 @@ def test_analyze_rejects_cross_cta_reduce():
         _analyze_cross_warp_workspace(src, (0,))
 
 
-def test_tir_reduce_has_no_cross_warp_only_attribute():
-    # The selection is runtime-derived; it MUST NOT leak into the TIR op schema.
-    op = TirReduce(axes=(-1,), kind=ReduceKind.SUM, warps_per_group=2)
+def test_tir_reduce_has_no_dispatch_parameters():
+    # The tier selection + warps_per_group are runtime-derived; they MUST NOT
+    # leak into the TIR op schema.
+    op = TirReduce(axes=(-1,), kind=ReduceKind.SUM)
     assert not hasattr(op, "cross_warp_only")
+    assert not hasattr(op, "warps_per_group")
 
 
 # ── Cross-warp reduce end-to-end (folded from the former e2e file) ───────────

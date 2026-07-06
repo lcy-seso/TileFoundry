@@ -16,7 +16,9 @@ when the reduction stays inside a single warp or the input is
 not mesh-sharded across an inter-warp topology.
 
 CUDA codegen forwards the workspace tensor to
-``tilefoundry::ops::reduce<Op, Axes>(src, dst, workspace)``.
+``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)``;
+the runtime derives the reduction level and its warps_per_group
+from the operand ``ShardLayout``s.
 """
 
 from __future__ import annotations
@@ -37,9 +39,12 @@ class Reduce(Op):
 
     Spec: tir.md §3.3
 
-    ``workspace`` is an optional scratch buffer used by the
-    runtime template for cross-warp staging; ``None`` when not
-    needed.
+    The 3-input form (``workspace`` present) lowers to the runtime
+    ``tilefoundry::ops::reduce_sharded<Op, Axes>(src, dst, workspace)`` entry;
+    the runtime derives the reduction level and its ``warps_per_group`` from the
+    operand ``ShardLayout``s. The op carries no dispatch parameter. ``workspace``
+    is an optional cross-warp staging buffer whose capacity is sized by the
+    lowering; ``None`` when not needed.
     """
     src = ParamDef(kind="input", pattern=Tensor)
     dst = ParamDef(kind="input", pattern=Tensor)
@@ -48,7 +53,6 @@ class Reduce(Op):
     )
     axes = ParamDef(kind="attribute", annotation=tuple)
     kind = ParamDef(kind="attribute", annotation=ReduceKind)
-    warps_per_group = ParamDef(kind="attribute", annotation=int, default=1)
 
 @register_typeinfer(Reduce)
 def _(call: "Call", ctx: "TypeInferContext") -> UnitType:
@@ -62,8 +66,7 @@ def _(call: "Call", ctx: "VerifyContext") -> None:
     src_ty = ctx.type_of(call.args[0])  # noqa: F841
     dst_ty = ctx.type_of(call.args[1])  # noqa: F841
     # Per-shard reshard lowering may produce rank-N (e.g.
-    # ``(1, 1, 1, 8)``) src tensors. The
-    # runtime template (``tilefoundry::ops::reduce<Op, Axes>``) iterates
-    # via ``cute::size(src)`` so rank is no longer relevant at the
-    # verifier level — the old rank<=2 guard predates the sharded
-    # reduce path.
+    # ``(1, 1, 1, 8)``) src tensors. The runtime template
+    # (``tilefoundry::ops::reduce_sharded<Op, Axes>``) iterates via
+    # ``cute::size(src)`` so rank is no longer relevant at the verifier level —
+    # the old rank<=2 guard predates the sharded reduce path.
