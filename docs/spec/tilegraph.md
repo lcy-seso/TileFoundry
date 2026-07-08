@@ -53,107 +53,103 @@ shared `SSAValue` whose `type` MUST be a `TensorType`.
 
 ### 3.2 `Domain`
 
-`Domain` is carried directly by `isl.set`:
-
-```
-Domain = isl.set
+```python
+Domain = isl.set    # legal iteration domain of the current TileGraph, carried by isl.set
 ```
 
-It represents the legal iteration domain of the current `TileGraph`.
+- constraints: none — carried directly by `isl.set`
+
+`Domain` is carried directly by `isl.set`. It represents the legal iteration
+domain of the current `TileGraph`.
 
 ### 3.3 `DomainRelation`
 
-`DomainRelation` is carried directly by `isl.multi_aff`:
-
-```
-DomainRelation = isl.multi_aff
+```python
+DomainRelation = isl.multi_aff    # map from parent TileGraph.domain onto current TileGraph.domain, carried by isl.multi_aff
 ```
 
-It maps the parent `TileGraph.domain` onto the current
-`TileGraph.domain`. `isl.multi_aff` is sufficient at this layer.
+- constraints: none — `isl.multi_aff` is sufficient at this layer
+
+`DomainRelation` is carried directly by `isl.multi_aff`. It maps the parent
+`TileGraph.domain` onto the current `TileGraph.domain`. `isl.multi_aff` is
+sufficient at this layer.
 
 ### 3.4 `AccessRelation`
 
-`AccessRelation` is also carried by `isl.multi_aff`:
-
-```
-AccessRelation = isl.multi_aff
+```python
+AccessRelation = isl.multi_aff    # affine map from current TileGraph.domain to a boundary value's index space, carried by isl.multi_aff
 ```
 
-It expresses the affine map from the current `TileGraph.domain` to a
-boundary value's index space. `AccessRelation` itself does not carry
-a tensor or value reference, a read / write mode, or any further
-semantics; those bindings live on the surrounding `TileGraph`'s
-boundary fields.
+- constraints:
+  - `AccessRelation` itself does not carry a tensor or value reference, a read /
+    write mode, or any further semantics; those bindings live on the surrounding
+    `TileGraph`'s boundary fields.
+
+`AccessRelation` is also carried by `isl.multi_aff`. It expresses the affine map
+from the current `TileGraph.domain` to a boundary value's index space.
 
 ### 3.5 `ITileNode`
 
+```python
+class ITileNode:
+    inputs: list[Value]     # boundary input Values
+    outputs: list[Value]    # boundary output Values
+```
+
+- constraints:
+  - `ITileNode` unifies graph-node boundaries only; it does not unify `domain`.
+
 `ITileNode` is the abstract base of every node that participates in
-a `TileGraph` body:
-
-```
-ITileNode
-  inputs:  Value[]
-  outputs: Value[]
-```
-
-`ITileNode` unifies graph-node boundaries only; it does not unify
-`domain`.
+a `TileGraph` body.
 
 ### 3.6 `DiGraph<TNode>`
 
-`TileGraph.body` is carried by a directed-graph object:
-
-```
-DiGraph<TNode>
-  nodes
-  edges
+```python
+class DiGraph(Generic[TNode]):
+    nodes    # the graph nodes
+    edges    # the graph edges
 ```
 
-Reading-style reference: networkx. The in-memory API is not pinned
-by this spec.
+- constraints: none — the in-memory API is not pinned by this spec (reading-style reference: networkx)
+
+`TileGraph.body` is carried by a directed-graph object. Reading-style
+reference: networkx. The in-memory API is not pinned by this spec.
 
 ### 3.7 `TileGraph`
 
-`TileGraph` is the composite node:
-
-```
-TileGraph : ITileNode
-  domain: Domain
-  domain_relation: DomainRelation        # optional; child graphs only
-  inputs:  Value[]
-  input_access_relations:  AccessRelation[]
-  outputs: Value[]
-  output_access_relations: AccessRelation[]
-  body: DiGraph<ITileNode>
+```python
+class TileGraph(ITileNode):
+    domain: Domain                                   # iteration domain of the current graph
+    domain_relation: DomainRelation                  # optional; child graphs only
+    inputs: list[Value]                              # boundary input Values
+    input_access_relations: list[AccessRelation]     # aligns positionally with inputs
+    outputs: list[Value]                             # boundary output Values
+    output_access_relations: list[AccessRelation]    # aligns positionally with outputs
+    body: DiGraph[ITileNode]                         # the directed graph at the current level
 ```
 
-Where:
+- constraints:
+  - the composite node; a per-level SSA DAG. `domain_relation` is present on
+    child graphs only.
 
-- `domain` is the iteration domain of the current graph.
-- `domain_relation` belongs to `TileGraph` only; ordinary `ITileNode`
-  members do not carry one.
-- `input_access_relations` aligns positionally with `inputs`.
-- `output_access_relations` aligns positionally with `outputs`.
-- `body` is the directed graph at the current level.
+`TileGraph` is the composite node.
 
 ### 3.8 `TileUnit`
 
-`TileUnit` is the minimum-unit node:
-
-```
-TileUnit : ITileNode
-  op_kind: str
-  inputs:  Value[]
-  outputs: Value[]
+```python
+class TileUnit(ITileNode):
+    op_kind: str            # the unit's op kind
+    inputs: list[Value]     # boundary input Values
+    outputs: list[Value]    # boundary output Values
 ```
 
-Where:
+- constraints:
+  - a `TileUnit` does not own its own `domain`,
+  - it does not own its own `domain_relation`,
+  - as the minimum unit it is interpreted under the `domain` of the
+    enclosing `TileGraph`.
 
-- a `TileUnit` does not own its own `domain`,
-- it does not own its own `domain_relation`,
-- as the minimum unit it is interpreted under the `domain` of the
-  enclosing `TileGraph`.
+`TileUnit` is the minimum-unit node.
 
 ## 4. Semantic skeleton
 

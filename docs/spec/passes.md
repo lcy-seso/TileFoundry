@@ -34,6 +34,7 @@ pass framework is:
 
 ## 2. `Pass` base class
 
+
 ```python
 from abc import ABC, abstractmethod
 from tilefoundry.ir.core import Module
@@ -50,13 +51,12 @@ class Pass(ABC):
     def run(self, module: Module) -> Module: ...
 ```
 
-Contract:
-
-- `run(module)` returns a new `Module`; it does not mutate input.
-- Passes MUST NOT depend on global state. All configuration enters
-  through constructor parameters or pass-local attributes.
-- Pass failures raise named exceptions (e.g. `VerifyError`); they
-  do not swallow errors.
+- constraints:
+  - `run(module)` returns a new `Module`; it does not mutate input.
+  - Passes MUST NOT depend on global state. All configuration enters
+    through constructor parameters or pass-local attributes.
+  - Pass failures raise named exceptions (e.g. `VerifyError`); they
+    do not swallow errors.
 
 ## 3. Three pass granularities
 
@@ -68,10 +68,14 @@ HIR → TIR replacement (substitute `tir.PrimFunction` for
 `hir.Function`).
 
 ```python
-class ModulePass(Pass):
+class ModulePass(Pass):                             # runs over the whole Module; may add / remove / reorder functions
     @abstractmethod
     def run(self, module: Module) -> Module: ...
 ```
+
+- constraints:
+  - `run` returns a new `Module`; inherits the `Pass` no-mutation / no-global-state
+    contract (§2).
 
 ### 3.2 `FunctionPass`
 
@@ -82,19 +86,15 @@ entries, and reassembles the `Module`.
 ```python
 from tilefoundry.ir.hir import Function as HirFunction
 
-class FunctionPass(Pass):
+class FunctionPass(Pass):                                                       # visits each hir.Function; framework supplies the default run
     @abstractmethod
-    def run_function(self, fn: HirFunction, module: Module) -> HirFunction: ...
-
-    def run(self, module: Module) -> Module:
-        new_fns = []
-        for fn in module.functions:
-            if isinstance(fn, HirFunction):
-                new_fns.append(self.run_function(fn, module))
-            else:
-                new_fns.append(fn)
-        return Module(name=module.name, functions=tuple(new_fns))
+    def run_function(self, fn: HirFunction, module: Module) -> HirFunction: ...  # visit one HIR function
+    def run(self, module: Module) -> Module: ...                                # default reassembles the Module from run_function results
 ```
+
+- constraints:
+  - inherits the `Pass` contract (§2); the default `run` reassembles the `Module`
+    from `run_function` results.
 
 ### 3.3 `PrimFuncPass`
 
@@ -104,12 +104,15 @@ nncase's `PrimFuncPass.cs`.
 ```python
 from tilefoundry.ir.tir import PrimFunction
 
-class PrimFuncPass(Pass):
+class PrimFuncPass(Pass):                                                       # visits each tir.PrimFunction (mirrors FunctionPass)
     @abstractmethod
     def run_prim_func(self, fn: PrimFunction, module: Module) -> PrimFunction: ...
-
     def run(self, module: Module) -> Module: ...   # default mirrors FunctionPass
 ```
+
+- constraints:
+  - inherits the `Pass` contract (§2); same shape as `FunctionPass` over
+    `tir.PrimFunction`.
 
 ## 4. Transform pass idiom
 
@@ -117,22 +120,11 @@ Transform passes use the visitor / mutator base classes from
 [visitor-mutator](./visitor-mutator.md) rather than hand-written
 `isinstance` dispatch.
 
-```python
-from tilefoundry.ir.visitor import StmtExprMutator
-from tilefoundry.passes.pass_base import PrimFuncPass
-
-class MyRewritePass(PrimFuncPass):
-    name = "my_rewrite"
-
-    class _Impl(StmtExprMutator):
-        def visit_Evaluate(self, stmt): ...   # match on Evaluate; dispatch on type(stmt.callable)
-
-    def run_prim_func(self, fn, module):
-        new_body = self._Impl().visit_stmt(fn.body)
-        if new_body is fn.body:
-            return fn                          # identity preservation
-        return replace(fn, body=new_body)
-```
+A transform `PrimFuncPass` wraps a `StmtExprMutator` subclass: `run_prim_func`
+runs the mutator over `fn.body`, returns `fn` unchanged when the mutator
+preserves identity (the returned body is the same object), and otherwise
+returns `replace(fn, body=new_body)`. The inner mutator matches on `Evaluate`
+and dispatches on `type(stmt.callable)`.
 
 The visit-and-rewrite contract — including the `visit_Evaluate`
 entry form for TIR effect Ops — is owned by
@@ -146,34 +138,17 @@ optionally drops per-pass IR dumps when wrapped in a
 
 ```python
 from dataclasses import dataclass, field
-from tilefoundry.dump import DumpFlags, DumpScope, dump
 
 @dataclass
 class PassManager:
-    passes: list[Pass] = field(default_factory=list)
+    passes: list[Pass] = field(default_factory=list)  # the registered passes, run in registration order
 
-    def add(self, p: Pass) -> "PassManager":
-        self.passes.append(p)
-        return self
-
-    def run(self, module: Module) -> Module:
-        self._check_requires()
-        for seq, p in enumerate(self.passes):
-            with DumpScope(f"{seq:02d}_{p.name}"):
-                dump("before.txt", repr(module), DumpFlags.PASS_IR)
-                module = p.run(module)
-                dump("after.txt", repr(module), DumpFlags.PASS_IR)
-        return module
-
-    def _check_requires(self) -> None:
-        """`requires` is an ordering assertion, not a topological sort."""
-        seen: set[str] = set()
-        for p in self.passes:
-            for r in p.requires:
-                if r not in seen:
-                    raise ValueError(f"pass {p.name!r} requires {r!r} not registered before it")
-            seen.add(p.name)
+    def add(self, p: Pass) -> "PassManager": ...      # register a pass; returns self for chaining
+    def run(self, module: Module) -> Module: ...      # run passes in registration order
 ```
+
+- constraints:
+  - `requires` is an ordering assertion checked before the run, not a topological sort.
 
 `PassManager` does not own a dump destination. When the caller
 wraps the run in a `DumpScope` and `DumpFlags.PASS_IR` is enabled,
@@ -233,17 +208,22 @@ unified retype / verify is scheduled by `PassManager`.
 
 ### 7.1 `HirToTirPass`
 
+```python
+class HirToTirPass(ModulePass):                     # replaces every hir.Function with a tir.PrimFunction
+    name = "hir_to_tir"
+```
+
+- constraints:
+  - TIR has no return-tensor form; HIR outputs become trailing params. The
+    per-op / mesh / `Reshard` / dispatch lowering rules are in the subsections
+    below.
+
 `ModulePass`. Replaces every `hir.Function` with a
 `tir.PrimFunction`, materialising the HIR `Function(params) →
 tensor` calling convention into the TIR explicit-output-param form
 `PrimFunction(params=(inputs..., outputs...), body=...)`. TIR has
 no return-tensor form. After this pass, `PassManager` reruns HIR
 `typeinfer` / TIR `verify` on the dirty scope.
-
-```python
-class HirToTirPass(ModulePass):
-    name = "hir_to_tir"
-```
 
 #### Per-op lowering dispatch
 
@@ -321,7 +301,7 @@ Worked example: `SM80_16x8x16_F32BF16BF16F32_TN` with
 #### Dispatch lowering
 
 The pass lowers each `Module.functions` entry by its shape
-([hir.md §5](./hir.md#5-dispatch-specializations)):
+([hir.md §1.1](./hir.md#11-function)):
 
 - A normal function (`variants == ()`) lowers on the default
   single-body path.
@@ -334,7 +314,7 @@ The pass lowers each `Module.functions` entry by its shape
      symbol, not by narrowed param types.
   2. The prototype emits one entry `tir.PrimFunction` under the
      unmangled `name` whose body is a single `tir.DispatchCall`
-     (see [tir.md §6](./tir.md#6-dispatchcall)):
+     (see [tir.md §1.6](./tir.md#16-dispatchcall)):
      - `subjects = (ShapeOf(param, axis),)` for the canonical
        `(param, axis)` of the dispatch `DimVar`;
      - `case_patterns` carries each variant's pattern in source
@@ -357,7 +337,7 @@ derived from `call.args[param_index].type.shape[axis]`:
 
 An empty reachable set is a compile-time error. Coverage and
 disjointness of the variants over the dispatch envelope are verified
-statically (the partition rule, [hir.md §5](./hir.md#5-dispatch-specializations)),
+statically (the partition rule, [hir.md §1.1](./hir.md#11-function)),
 so an in-envelope shape always selects exactly one variant. The
 `tir.DispatchCall.fallback` (`Abort`) is reached only by an
 out-of-envelope shape — a call-contract violation.
@@ -367,7 +347,7 @@ gains a hidden scalar parameter named `<param.name>_shape_<axis>` of
 `TensorType((), i32)`. The CUDA host wrapper extracts the value from
 the runtime tensor's shape; the parameter is invisible at the user
 FFI surface (see
-[codegen §5](./codegen.md#5-dispatch-and-shape-scalar-abi)).
+[target §6](./target.md#6-dispatch-and-shape-scalar-abi)).
 
 ### 7.2 `BufferizePass`
 
@@ -383,10 +363,14 @@ gets an independent physical allocation; no reuse, pool, or lifetime
 overlap. Buffer planning is not a codegen responsibility.
 
 ```python
-class BufferizePass(PrimFuncPass):
+class BufferizePass(PrimFuncPass):                  # assigns each logical buffer a physical offset / size after HirToTirPass
     name = "bufferize"
     requires = ("hir_to_tir",)
 ```
+
+- constraints:
+  - every logical buffer gets an independent physical allocation; no reuse, pool,
+    or lifetime overlap. Buffer planning is not a codegen responsibility.
 
 ## 8. Directory layout
 

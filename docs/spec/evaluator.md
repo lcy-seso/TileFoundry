@@ -46,31 +46,36 @@ single-output node produces a `TensorValue`; a multi-output node (a
 produces a `TupleValue`.
 
 ```python
-class Value:
-    """Base of every evaluated value."""
-
-@dataclass(frozen=True)
-class TensorValue(Value):
-    data: "torch.Tensor"     # logical tensor value
-    type: TensorType         # HIR type of this value (carries layout)
-
-@dataclass(frozen=True)
-class TupleValue(Value):
-    elements: tuple[Value, ...]
+class Value: ...    # base of every evaluated value
 ```
+
+- constraints: none — abstract base; concrete values are `TensorValue` / `TupleValue`
 
 ### `TensorValue`
 
-- `data` holds the value in its **logical shape** — the shape of
-  `type` ([types §2](./types.md)), not a layout-domain shape.
-- `type.layout`, when a `ShardLayout` or `Layout`, drives the
-  layout-domain projection of [§6](#6-layout-domain).
-- A scalar value is a rank-0 `data` with a rank-0 `TensorType`.
+```python
+class TensorValue:
+    data: torch.Tensor    # the logical tensor value
+    type: TensorType      # the HIR type of this value (carries layout)
+```
+
+- constraints:
+  - `data` holds the value in its **logical shape** — the shape of
+    `type` ([types §2](./types.md)), not a layout-domain shape.
+  - `type.layout`, when a `ShardLayout` or `Layout`, drives the
+    layout-domain projection of [§6](#6-layout-domain).
+  - A scalar value is a rank-0 `data` with a rank-0 `TensorType`.
 
 ### `TupleValue`
 
-- `elements` are the per-field `Value`s; `tuple_get_item` projects one
-  by static index.
+```python
+class TupleValue:
+    elements: tuple[Value, ...]    # the per-field `Value`s
+```
+
+- constraints:
+  - `elements` are the per-field `Value`s; `tuple_get_item` projects one
+    by static index.
 
 ## 2. Parameters and inputs
 
@@ -102,14 +107,15 @@ def register_eval(op_cls: type[Op]): ...   # decorator
 
 A handler receives an `EvalContext` and returns a `Value`:
 
-- `ctx.args` — the already-evaluated operands in `Call.args` order; each
-  is a `Value` (`TensorValue`, or `TupleValue` for a multi-output
-  operand).
-- `ctx.op` — the op instance; attributes are read as fields (e.g.
-  `ctx.op.kind`, `ctx.op.index`).
-- `ctx.result_type` — the `Call`'s result type.
-- `ctx.device` — the backend device; a handler that materialises a new
-  tensor (e.g. `Zeros`) creates it there.
+```python
+class EvalContext:
+    args: tuple[Value, ...]    # already-evaluated operands in `Call.args` order (TensorValue / TupleValue)
+    op: Op                     # the op instance; attributes read as fields (e.g. `ctx.op.kind`, `ctx.op.index`)
+    result_type: Type          # the `Call`'s result type
+    device: torch.device       # backend device; a handler materialising a new tensor (e.g. `Zeros`) creates it there
+
+def handler(ctx: EvalContext) -> Value: ...    # a registered per-op value handler
+```
 
 A `Call` whose op class has no registered handler raises an error that
 names the op class. Backend dtype promotion follows the backend's own
@@ -119,57 +125,31 @@ rules; a handler MUST NOT depend on type inference having run.
 
 Evaluation is an `ExprVisitor[Value]`
 ([visitor-mutator §1](./visitor-mutator.md)) memoized on `id(expr)`, so
-a shared sub-DAG ([hir §1](./hir.md)) is evaluated once:
+a shared sub-DAG ([hir §1.1](./hir.md)) is evaluated once:
 
 ```python
-def visit(expr):                      # memoized: id(expr) -> Value
-    match expr:
-        case Var():
-            return env[expr]
-        case Constant():
-            return TensorValue(as_tensor(expr.value, expr.type.dtype), expr.type)
-        case Tuple():
-            return TupleValue(tuple(visit(e) for e in expr.elements))
-        case Call(target=Op() as op):                  # value op
-            args = tuple(visit(a) for a in expr.args)
-            return eval_registry[type(op)](EvalContext(op, args, expr.type))
-        case Call(target=Function() as fn):            # function call
-            args = [visit(a) for a in expr.args]
-            sub_env = {p: a for p, a in zip(fn.params, args)}
-            return Evaluator(sub_env).visit(fn.body)
-        case GridRegionExpr():
-            return eval_grid(expr)                      # §5
+class Evaluator(ExprVisitor[Value]):             # memoized on id(expr): a shared sub-DAG is evaluated once
+    def visit(self, expr: Expr) -> Value: ...    # dispatch by expr kind: Var / Constant / Tuple / Call(Op) / Call(Function) / GridRegionExpr
 ```
 
 - A `Var` resolves to its binding in the current environment; a
-  `Constant` ([core-ir §3](./core-ir.md)) materialises to a backend
+  `Constant` ([core-ir §2](./core-ir.md)) materialises to a backend
   tensor of its `TensorType` (a scalar becomes a rank-0 tensor).
 - A `Call` whose `target` is an `Op` evaluates its operands, then
   dispatches through `eval_registry`
   ([§3](#3-register_eval-and-the-eval-context)).
-- A `Call` whose `target` is a `Function` ([hir §1](./hir.md)) binds the
+- A `Call` whose `target` is a `Function` ([hir §1.1](./hir.md)) binds the
   evaluated arguments to the callee's parameters in a fresh environment
   and evaluates the callee `body` — the same value semantics a call site
   has under type inference.
 
 ## 5. `GridRegionExpr`
 
-A `GridRegionExpr` ([hir §4](./hir.md)) is a loop over its iteration
+A `GridRegionExpr` ([hir §1.2](./hir.md)) is a loop over its iteration
 domain whose carry chain starts from `init_args`:
 
 ```python
-def eval_grid(region):
-    if not region.carried_args:                        # no-carry loop
-        for i in range(0, region.extent, region.step):
-            last = Evaluator({**env, iv: scalar(i)}).visit(region.body)
-        return last                                    # final body value
-
-    carried = [visit(init) for init in region.init_args]
-    for i in range(0, region.extent, region.step):
-        scope = {**env, region.induction_var: scalar(i)}
-        scope.update(zip(region.carried_args, carried))
-        carried = [Evaluator(scope).visit(y) for y in region.yield_values]
-    return carried[0] if len(carried) == 1 else TupleValue(tuple(carried))
+def eval_grid(region: GridRegionExpr) -> Value: ...    # loop over the iteration domain; carry chain starts from init_args
 ```
 
 - The first iteration binds each `carried_args` phi to the matching
@@ -191,7 +171,7 @@ values:
   `axes` in the operand's **logical** `TensorType.shape`, regardless of
   `type.layout`. A computation that must group a logical axis differently
   (e.g. per-head normalisation) is expressed by a logical `Reshape`
-  ([hir §2.2](./hir.md)) to the target logical shape *before* the op; the
+  ([hir §1.3](./hir.md)) to the target logical shape *before* the op; the
   op's axis then indexes that reshaped logical shape. `Reshard` only
   changes distribution / layout and never changes which values an op
   reduces or indexes.
@@ -202,8 +182,8 @@ values:
   inverse. These are provided for an op explicitly defined to compute in
   the layout domain; no op in the current set is layout-domain, so none
   of them call these helpers.
-- `Reshard` ([hir §2.5](./hir.md)) preserves the logical value and MAY
+- `Reshard` ([hir §1.3](./hir.md)) preserves the logical value and MAY
   reshape it into the target layout's shape; it performs no
   cross-participant data movement.
-- `Local` ([hir §2.5](./hir.md)) returns its operand's value for the
+- `Local` ([hir §1.3](./hir.md)) returns its operand's value for the
   single modelled participant.

@@ -16,28 +16,29 @@ solely because a specific spec rule requires it.
 
 ## Unified Entry Format
 
-Spec entries for ops, runtime functions, public classes, and pass/helper classes
-use one outer shell:
+A spec entry shows the construct's **source-code interface** — the
+class / enum / struct / function / op-callable surface with field annotations
+and method signatures (ending in `...`, no bodies), each field or method given a
+short inline comment for its role — followed by a `- constraints:` list:
 
 ````md
 #### Name
-```text
-signature / ClassName<...>
+```python
+class Name:
+    field_a: TypeA                        # role of field_a
+    def method(self, arg: T) -> R: ...    # role of method
 ```
-- kind: HIR op | TIR op | runtime func | C++ class | Python class/pass
-- fields:
-  - name: role or argument/member/effect description
 - constraints:
-  - contract rule
+  - contract rule (every normative MUST / SHALL / SHOULD sentence lives here)
 ````
 
-The `fields` content adapts to `kind`: class entries describe members/type
-fields; function entries describe arguments, returns, effects, or runtime state.
-Do not paste a full dataclass or re-list code-identical fields when a compact
-signature and a few stable keys carry the contract.
+Interface only: no method body, traversal, or registry / decorator
+implementation. Write the construct in its own language (`python` / `cpp`). One
+block may group a family of related signatures. Example code appears only to pin
+an ambiguous contract corner, never to repeat an implementation.
 
 Consensus ops may be grouped when one external reference defines their behavior.
-Custom TileFoundry ops and public runtime entries need their own compact entry.
+Custom TileFoundry ops and public runtime entries need their own entry.
 
 ## Constraints
 

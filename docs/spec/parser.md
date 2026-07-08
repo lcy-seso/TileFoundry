@@ -32,11 +32,11 @@ in [§2.7](#27-module-authoring-surface)). A method MAY call a sibling method
 declared *above* it — the call lowers to a `Call` targeting that
 sibling function; forward references (a callee declared below the
 caller) are unresolved (see [§3.3](#33-description)). Functions are
-reached by name on the result (see [core-ir §2.1](./core-ir.md#21-function-access)).
+reached by name on the result (see [core-ir §1.1](./core-ir.md#11-function-access)).
 
 `@tilefoundry.func` and `@tilefoundry.prim_func` decorate functions and
 evaluate to the parsed IR directly: `@func` to a `hir.Function`
-([hir.md §1](./hir.md#1-function)), `@prim_func` to a
+([hir.md §1.1](./hir.md#11-function)), `@prim_func` to a
 `tir.PrimFunction`. The decorated name binds to that IR node, not to
 the original Python function. Used standalone (outside a `@module`
 class), passing the resulting function to `compile` / `jit` lifts it
@@ -54,6 +54,58 @@ class M:
     def f(...):
         return g(...)   # sibling g is declared above → resolves to g's Function
 ```
+
+**Specialization decorators.** A function specializes its body per input
+shape through `Function.specialize`. The base function is defined with
+`@tilefoundry.func`; each variant is added by decorating a throwaway `def`
+with `@base.specialize(pattern)`:
+
+```python
+S = DimVar("S", 1, 9)                                          # envelope [1, 9) = 1..8
+
+@tilefoundry.func
+def f(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
+    pass                                                       # prototype base
+
+@f.specialize(DimVarRangePat("S", 1, 5))
+def _(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
+    return small_impl(x)                                       # variant [1, 5) = 1..4
+
+@f.specialize(DimVarRangePat("S", 5, 9))
+def _(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
+    return large_impl(x)                                       # variant [5, 9) = 5..8
+```
+
+- `@tilefoundry.func` evaluates to the base `hir.Function`. `func()` has no
+  `specializations=` parameter; specialization is reachable only through
+  `.specialize`.
+- The prototype base body is `pass`: it declares the signature and dispatch
+  envelope only and parses to `Function.body is None`. The implementations
+  live in the variants ([hir.md §1.1](./hir.md#11-function)). A
+  `pass` body is legal only for a function that receives variants; a `pass`
+  body with no variants, or a real body combined with variants, is rejected.
+- `base.specialize(pattern)` returns a decorator. It parses the decorated
+  `def` into a variant `hir.Function` (same `name` as the base,
+  `specializations=(pattern,)`), registers it on `base.variants`, and
+  returns the variant. The decorated name is a throwaway: `def _` is
+  reusable across variants because the base is the persistent handle.
+- `pattern` MUST be a single `DimVarRangePat` (see
+  [core-ir §3](./core-ir.md#3-pattern)); other `Pattern` subclasses are rejected for
+  v0. The referenced `DimVar` and its `(lo, hi)` envelope live on the base
+  parameter's shape. Each variant's range MUST fall within that envelope,
+  and the full variant set MUST partition it — disjoint and complete (see
+  [hir.md §1.1](./hir.md#11-function)). Two variants with the
+  same canonical signature are rejected.
+- A `DimVar` shape entry MAY be written **inline** (`DimVar("S", lo, hi)`
+  AST node in the shape tuple) or as a **named alias** (`S = DimVar("S",
+  lo, hi)` then `Tensor[(S,), ...]`). Both resolve to the same `DimVar`
+  instance (type-level cache keyed by `(name, lo, hi)`). A second `DimVar`
+  with the same `name` but conflicting `(lo, hi)` is a hard parse-time
+  error.
+- Variants accumulate on the base only during authoring. Once the base
+  enters a `Module` (see [core-ir §1](./core-ir.md#1-module)) it is sealed and
+  `.specialize` raises. A variant lives only inside `base.variants`; it is
+  never a separate `Module.functions` entry.
 
 ### 1.2 DSL namespace
 
@@ -196,18 +248,20 @@ exactly; otherwise the sugar is rejected. The factorisation is
 opaque to the user: input `N @ m.a` and input
 `(mesh_extent(a) @ m.a, N // mesh_extent(a))` produce the same IR.
 
-**Stride materialization (parser surface)**. The first sugar form
+#### Stride materialization (parser surface)
+
+The first sugar form
 (`'(' axis-spec ... ')'`) emits `Layout(shape=canonical,
 strides=None)` — the cute strides are deferred to `Reshard`
 typeinfer, which fills them in based on the storage-level direction
-(see [hir.md §3](./hir.md#3-typing--structural-rules)). The
+(see [hir.md §1.3](./hir.md#13-op)). The
 verbose form (`'(' axis-tuple ',' stride-tuple ')'`) emits a
 concrete `strides` tuple; typeinfer respects it verbatim. The
 parser does NOT inspect `storage` or do any physical-materialization
 logic — that responsibility lives entirely in `Reshard` typeinfer.
 
 Spec: [shard.md §7.1.1](./shard.md#711-layoutshape),
-[hir.md §3](./hir.md#3-typing--structural-rules).
+[hir.md §1.3](./hir.md#13-op).
 
 Layout sugar is accepted **anywhere the expected surface value is
 a `ShardLayout`**. Dispatch is annotation-driven (see §4.4): the
@@ -248,7 +302,7 @@ in what it lowers to:
   inside `suite`. A tensor's mesh/layout lives on its
   `TensorType.layout`, not on the block it is written in; `reshard` is
   the explicit boundary, and op typeinfer
-  ([hir §3](./hir.md#3-typing--structural-rules)) decides whether values
+  ([hir §1.3](./hir.md#13-op)) decides whether values
   combine.
 - **TIR** lowers it to an explicit `MeshScope` Stmt (§6) carrying the
   `Mesh` and the binding `Var`.
@@ -264,7 +318,7 @@ loop-args   ::= extent-Expr                        # tile: extent / range: stop
 ```
 
 `tile(...)` and `range(...)` share **one** loop domain `(start, extent,
-step)` and lower to the **same** `GridRegionExpr` ([hir §4](./hir.md)) —
+step)` and lower to the **same** `GridRegionExpr` ([hir §1.2](./hir.md)) —
 `range` is not a separate construct and is **not** statically unrolled. The
 only difference is the loop-variable binding:
 
@@ -282,7 +336,7 @@ only difference is the loop-variable binding:
 domain is half-open `[start, extent)`) / `step-Expr` MAY be any `ShapeDim`
 ([types §4](./types.md)), including a dim expression such as `C // N`; the
 value is carried verbatim into `GridRegionExpr.start` / `.extent` / `.step`
-and resolved at evaluate time ([hir §4](./hir.md)).
+and resolved at evaluate time ([hir §1.2](./hir.md)).
 
 A tensor subscript `x[slice0, …]` inside a loop body lifts to a
 `hir.tensor.Slice` Op call. An `ast.Assign` whose single Name target is
@@ -346,23 +400,14 @@ for any name not found on the module's own namespace. Both
 namespaces implement it identically:
 
 ```python
-def __getattr__(name: str) -> type[Op] | Callable:
-    schemas = op_registry.get_schemas(_DIALECT, name)
-    if not schemas:
-        raise AttributeError(name)
-    first = schemas[0]
-    # Surface-alias schema (op_class is None): return the alias
-    # builder fn — it carries `_op_schema` so parser dispatch
-    # recovers the schema uniformly via getattr.
-    if first.op_class is None:
-        return first.builder
-    if len(schemas) == 1:
-        return first.op_class             # bind Op class itself
-    return _make_overload_resolver(schemas)
-
-def __dir__() -> list[str]:
-    return list(op_registry.iter_schema_names(_DIALECT))
+def __getattr__(name: str) -> type[Op] | Callable: ...   # resolve a dialect name to its Op class / alias builder
+def __dir__() -> list[str]: ...                          # list the dialect's registered schema names
 ```
+
+`__getattr__` looks up `op_registry.get_schemas(_DIALECT, name)` and raises
+`AttributeError` on a miss; for a single real-Op schema it returns the `Op`
+class, for a surface-alias schema (`op_class is None`) the alias builder fn, and
+for more than one schema an overload resolver.
 
 Both forms (Op class for real-Op schemas, alias builder fn for
 alias schemas) carry an `_op_schema` attribute, so the parser's
@@ -454,7 +499,7 @@ registry.
   visibility (§2.5).
 - `T.cuda.mma` is the CUDA MMA surface: `T.cuda.mma.<NAME>` is an
   `MmaOpSpec` and `T.cuda.mma.atom(op=...)` an `MmaAtom`
-  ([tir §3.7](./tir.md#37-mma-atom-and-the-hand-written-calling-convention)).
+  ([tir §2.3](./tir.md#mma-atom-and-the-hand-written-calling-convention)).
   The folder name (`cuda`) matches `codegen/cuda/` and the runtime tree.
 
 In a `@prim_func` body a chain rooted at a platform sub-namespace is a
@@ -469,7 +514,7 @@ surface so editors complete `T.cuda.mma.<NAME>` and `.atom(...)`.
 ### 2.7 `@module` authoring surface
 
 `@module(entry="<name>")` collects a class of DSL functions into a
-`Module` ([core-ir §2.1](./core-ir.md)). The decorated name binds to the
+`Module` ([core-ir §1](./core-ir.md#1-module)). The decorated name binds to the
 resulting `Module`.
 
 - Every non-dunder class member MUST be an `@func` / `@prim_func` result (an
@@ -634,7 +679,7 @@ real-Op schema sharing the same name.
 
 A registered Op has one or more `OpSchema` entries indexed by
 `(dialect, name)`. Each schema lists the Op's `ParamDef` descriptors
-(see [core-ir §4](./core-ir.md)). When the parser sees a callee:
+(see [core-ir §2.3](./core-ir.md)). When the parser sees a callee:
 
 1. Look up the schema list via
    `op_registry.get_schemas(dialect, name)`.
@@ -700,7 +745,7 @@ prototype** that awaits variants. Immediately after `@func def f: pass`
 and before any `@f.specialize(...)`, the base is transiently
 `body is None, variants == ()` — a valid *unsealed authoring* state. The
 sealed (verified) invariant is `body is None` ⟺ `variants != ()`
-([hir.md §5](./hir.md#5-dispatch-specializations)); the verifier rejects a
+([hir.md §1.1](./hir.md#11-function)); the verifier rejects a
 `body is None` function with no variants, a variant whose body is `pass`
 (a variant MUST carry a real body), and a real body combined with
 variants. The `@base.specialize(...)` parse rejects a `pass`-bodied
@@ -733,7 +778,7 @@ imperative statements that fold into a `Sequential` of Stmts.
 | Python | TIR action |
 |---|---|
 | `x = expr` | `LetStmt(var=x, value=expr, body=<sequential rest>)`. The remaining body of the function is nested as `body`. |
-| `a = Tensor(...)` | `LetStmt(var=a, value=Call(tir.memory.AllocTensor, (), attrs=<TensorType fields>), body=<rest>)`. See [tir §5.1](./tir.md). |
+| `a = Tensor(...)` | `LetStmt(var=a, value=Call(tir.memory.AllocTensor, (), attrs=<TensorType fields>), body=<rest>)`. See [tir §2.3](./tir.md#23-tir-ops). |
 | `foo(a, b)` (effect Op) | `Evaluate(target_op, args)` Stmt. |
 | `foo(a, b)` (value Op) | `Call` Expr embedded in the right-hand side of a `LetStmt` or another Stmt's Expr field. |
 | `for i in range(...)` | `For(induction_var=i, start, stop, step, body)`. |
@@ -764,57 +809,3 @@ TIR has no SSA-as-DAG sharing rule; every binding is an explicit
 - Layout sugar that would lose mesh information falls through to the
   verbose form (§1.4); if neither is acceptable, the type is
   rejected.
-
-## 8. Dispatch specializations
-
-A function specializes its body per input shape through
-`Function.specialize`. The base function is defined with `@tilefoundry.func`;
-each variant is added by decorating a throwaway `def` with
-`@base.specialize(pattern)`:
-
-```python
-S = DimVar("S", 1, 9)                                          # envelope [1, 9) = 1..8
-
-@tilefoundry.func
-def f(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
-    pass                                                       # prototype base
-
-@f.specialize(DimVarRangePat("S", 1, 5))
-def _(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
-    return small_impl(x)                                       # variant [1, 5) = 1..4
-
-@f.specialize(DimVarRangePat("S", 5, 9))
-def _(x: Tensor[(S,), "f32"]) -> Tensor[(S,), "f32"]:
-    return large_impl(x)                                       # variant [5, 9) = 5..8
-```
-
-- `@tilefoundry.func` evaluates to the base `hir.Function`. `func()` has no
-  `specializations=` parameter; specialization is reachable only through
-  `.specialize`.
-- The prototype base body is `pass`: it declares the signature and dispatch
-  envelope only and parses to `Function.body is None`. The implementations
-  live in the variants ([hir.md §5](./hir.md#5-dispatch-specializations)). A
-  `pass` body is legal only for a function that receives variants; a `pass`
-  body with no variants, or a real body combined with variants, is rejected.
-- `base.specialize(pattern)` returns a decorator. It parses the decorated
-  `def` into a variant `hir.Function` (same `name` as the base,
-  `specializations=(pattern,)`), registers it on `base.variants`, and
-  returns the variant. The decorated name is a throwaway: `def _` is
-  reusable across variants because the base is the persistent handle.
-- `pattern` MUST be a single `DimVarRangePat` (see
-  [core-ir §7](./core-ir.md)); other `Pattern` subclasses are rejected for
-  v0. The referenced `DimVar` and its `(lo, hi)` envelope live on the base
-  parameter's shape. Each variant's range MUST fall within that envelope,
-  and the full variant set MUST partition it — disjoint and complete (see
-  [hir.md §5](./hir.md#5-dispatch-specializations)). Two variants with the
-  same canonical signature are rejected.
-- A `DimVar` shape entry MAY be written **inline** (`DimVar("S", lo, hi)`
-  AST node in the shape tuple) or as a **named alias** (`S = DimVar("S",
-  lo, hi)` then `Tensor[(S,), ...]`). Both resolve to the same `DimVar`
-  instance (type-level cache keyed by `(name, lo, hi)`). A second `DimVar`
-  with the same `name` but conflicting `(lo, hi)` is a hard parse-time
-  error.
-- Variants accumulate on the base only during authoring. Once the base
-  enters a `Module` (see [core-ir §2](./core-ir.md)) it is sealed and
-  `.specialize` raises. A variant lives only inside `base.variants`; it is
-  never a separate `Module.functions` entry.

@@ -45,8 +45,8 @@ flowchart TB
 any `LayoutBase`. Pure-layout invariants and shard-binding
 invariants live with the construct they constrain. Enforcement is
 dispatched by [visitor-registry](./visitor-registry.md); concrete
-checks live in [tir §4](./tir.md#4-verify-rules) (TIR side) and
-[hir §3](./hir.md#3-typing--structural-rules) (HIR side).
+checks live in [tir §1.3](./tir.md#13-primfunction) (TIR side) and
+[hir §1.3](./hir.md#13-op) (HIR side).
 
 ---
 
@@ -56,8 +56,12 @@ The primitive building block, taken from pycute's `shape` / `stride`
 convention. It is not just a flat tuple — nested tuples are allowed:
 
 ```python
-IntTuple = int | tuple["IntTuple", ...]
+IntTuple = int | tuple[IntTuple, ...]    # entry: an `int`, a symbolic/dynamic dim (`ShapeDim`), `None` (launch-provided extent), or a nested `IntTuple`
 ```
+
+- constraints:
+  - admits both a unique flat `int`-tuple view and a unique nested-structure view;
+    the `shape` / `strides` of `Layout` and `ShardLayout` are `IntTuple`.
 
 Flatten-equivalence: every `IntTuple` admits both a unique flat
 `int`-tuple view and a unique nested-structure view. The `shape` and
@@ -67,7 +71,7 @@ A `shape` / `stride` entry is not restricted to a static `int`: it may be a
 symbolic / dynamic dim (a `DimVar` or dim `Expr` — a `ShapeDim`), or `None`
 for a launch-provided (dynamic-CTA) extent (`Layout(shape=(None,),
 strides=(1,))`). Consumers that need a concrete integer — `Mesh.__getitem__`
-and `T.sync` participation (tir.md §2.4) — require static `int` entries and
+and `T.sync` participation (tir.md §1.5) — require static `int` entries and
 **fail closed** on a symbolic / dynamic one rather than guessing.
 
 ---
@@ -78,11 +82,15 @@ and `T.sync` participation (tir.md §2.4) — require static `int` entries and
 the `Layout` hierarchy:
 
 ```python
-class LayoutBase: pass
-class Layout(LayoutBase): ...
-class ComposedLayout(LayoutBase): ...
-class ShardLayout(LayoutBase): ...
+class LayoutBase: ...                    # abstract base
+class Layout(LayoutBase): ...            # concrete `LayoutBase` member
+class ComposedLayout(LayoutBase): ...    # concrete `LayoutBase` member
+class ShardLayout(LayoutBase): ...       # concrete `LayoutBase` member
 ```
+
+- constraints:
+  - `TensorType.layout` accepts only objects in this hierarchy; the common contract
+    below applies to every legal layout object.
 
 Common contract — every legal layout object MUST satisfy:
 
@@ -104,11 +112,14 @@ An object that does not satisfy these conditions cannot enter
 Mirrors `pycute.layout.Layout`:
 
 ```python
-@dataclass(frozen=True)
 class Layout(LayoutBase):
-    shape: IntTuple        # entries: ShapeDim | None (§1)
-    stride: IntTuple | None = None  # entries: ShapeDim; whole tuple None = un-materialized
+    shape: IntTuple                 # layout-domain shape (entries `ShapeDim | None`)
+    stride: IntTuple | None = None  # step rule from domain to physical index; whole tuple `None` = un-materialized
 ```
+
+- constraints:
+  - the pure primitive layout; it has no `offset` field. Field meanings and
+    semantics below.
 
 Field meanings:
 
@@ -139,12 +150,15 @@ The primitive `Layout` has **no** `offset` field. `offset` belongs to
 Mirrors CuTeDSL `make_composed_layout(inner, offset, outer)`:
 
 ```python
-@dataclass(frozen=True)
 class ComposedLayout(LayoutBase):
-    inner: LayoutBase
-    offset: int
-    outer: LayoutBase
+    inner: LayoutBase   # applied last (output-side layout)
+    offset: int         # intermediate scalar offset (a property of the composition)
+    outer: LayoutBase   # applied first (input / domain-side layout)
 ```
+
+- constraints:
+  - `idx = inner(offset + outer(coord))`; inherits domain shape and axis numbering
+    from `outer`.
 
 Field meanings:
 
@@ -169,38 +183,31 @@ axis exposed by `outer`.
 ## 5. `Mesh`
 
 ```python
-@dataclass(frozen=True)
-class Topology:
+class Topology:                            # device-domain description
     name: str
     num_devices: int
 
-@dataclass(frozen=True)
-class Mesh:
+class Mesh:                                # the parallel device domain
     topology: Topology
-    layout: Layout | ComposedLayout
+    layout: Layout | ComposedLayout        # a plain `Layout` (un-sliced) or a `ComposedLayout` (a constant `m[...]` slice)
     names: tuple[str, ...] | None = None
-    # compile-time constant; Python value, does not enter the IR graph.
-    # ``layout`` is a plain ``Layout`` for an un-sliced mesh. ``Mesh[key]``
-    # (``__getitem__``) slices a constant sub-mesh used by ``T.sync``
-    # (tir.md §2.4): it replaces ``layout`` with a ``ComposedLayout`` recording
-    # the participating sub-box — the selected per-axis extents over the parent
-    # strides in ``outer`` and the slice origin ``Σ start_i · stride_i`` in
-    # ``offset`` (identity ``inner``). The slice never becomes an IR/SSA value;
-    # the enclosing full mesh supplies the parent shape when a slice is verified.
 
-@dataclass(frozen=True)
-class MeshAxis:
+class MeshAxis:                            # single-axis object via `mesh.x` / `mesh.axes[i]`
     mesh: Mesh
     index: int
     size: int
 ```
+
+- constraints:
+  - a compile-time constant that does not enter the IR graph; describes the device
+    domain, not a tensor layout object. A slice never becomes an IR/SSA value.
 
 Field meanings:
 
 - `topology` — device-domain description (`name` + `num_devices`)
 - `layout` — the mesh's own shape / strides (a `Layout`); a constant slice
   (`m[...]`) replaces it with a `ComposedLayout` recording the sub-box
-  (tir.md §2.4)
+  (tir.md §1.5)
 - `names` — optional human-readable names (`cta.x`, `cta.y`, …)
 - `MeshAxis` — single-axis object retrieved via `mesh.x` / `mesh.y` /
   `mesh.axes[i]`, used by parser static evaluation
@@ -214,22 +221,20 @@ object.
 ## 6. `ShardAttr`
 
 ```python
-@dataclass(frozen=True)
-class Split:
+class Split:                          # binds the current mesh axis to the layout's `axis`-th cute domain axis
     axis: int
 
-@dataclass(frozen=True)
-class Broadcast:
-    pass
+class Broadcast: ...                  # the value is replicated across this mesh axis
 
-@dataclass(frozen=True)
-class Dynamic:
-    pass
+class Dynamic: ...                    # the distribution policy is not yet resolved
 
-@dataclass(frozen=True)
-class Partial:
-    reduction: str = "sum"    # "sum" / "max" / "min"
+class Partial:                        # an un-reduced partial value (`sum` / `max` / `min`)
+    reduction: str = "sum"
 ```
+
+- constraints:
+  - each entry of `ShardLayout.attrs` describes one mesh axis by its tuple
+    position; per-attr semantics and surface sugar below.
 
 Each entry of `ShardLayout.attrs` describes one **mesh axis** (by its
 position in the tuple); the attr says what that mesh axis does. `Split`
@@ -279,12 +284,15 @@ a new layout-algebra primitive, it binds an underlying layout's domain
 axes to mesh axes.
 
 ```python
-@dataclass(frozen=True)
 class ShardLayout(LayoutBase):
-    layout: LayoutBase            # Layout or ComposedLayout being bound
-    attrs: tuple[Split | Broadcast | Dynamic | Partial, ...]
-    mesh: Mesh
+    layout: LayoutBase                                        # the underlying `Layout` / `ComposedLayout` being bound
+    attrs: tuple[Split | Broadcast | Dynamic | Partial, ...]  # per-mesh-axis attributes, ordered by mesh axis
+    mesh: Mesh                                                # the device-domain `Mesh`
 ```
+
+- constraints:
+  - the distributed binding layer; binds an underlying layout's domain axes to mesh
+    axes without a new layout-algebra primitive. Sub-field contracts in §7.1–§7.5.
 
 The distribution-changing transformation (redistribute / sharding) is
 itself an IR op (`hir.sharding.Reshard`, see [hir](./hir.md) §2.5).
@@ -336,7 +344,7 @@ relevant mesh axis.
   strides have not yet been fixed; the layout's `shape` /
   partition is determined but the per-axis stride form is deferred
   to `Reshard` typeinfer
-  ([hir.md §3](./hir.md#3-typing--structural-rules)). Surface
+  ([hir.md §1.3](./hir.md#13-op)). Surface
   sugar `(N @ m.a, ...)` always emits `S is None`; verbose
   `((shape), (strides))` always emits a concrete `S`. After
   `Reshard` typeinfer has run on a value, `S` reachable from that
@@ -417,71 +425,17 @@ buffer.
 A reshard whose user-provided cute strides are non-default (e.g. an
 SM80 mma fragment) bypasses this materialization step: the layout
 already has a concrete `strides` tuple, so the `Reshard` typeinfer
-rule ([hir.md §3](./hir.md#3-typing--structural-rules)) preserves
+rule ([hir.md §1.3](./hir.md#13-op)) preserves
 it verbatim.
 
 ---
 
-## 8. Logical shape to layout domain
+## 8. Layout propagation
 
-- `TensorType.shape` is the logical shape.
-- `layout` has its own domain shape.
-- The current interpretation is canonical regroup: linearize first
-  along the logical shape's row-major order, then reinterpret along
-  the layout domain's row-major order.
-
-## 9. Relation-driven shard propagation
-
-When an op's output `ShardLayout` is derived from a forward access
-relation ([hir §3.1](./hir.md#31-relation-driven-type-validity)), the
-output `ShardAttr`s are determined from the input shards and the
-relation's access maps by a single rule, shared across ops.
-
-**Reduction effect.** A reduction dim (a domain dim absent from the
-output access map) carries one of two effects, declared by the
-op/relation:
-
-- `partial` — the per-shard result is a partial that still needs a
-  cross-shard reduction (e.g. a contraction dim split across the mesh);
-- `complete` — the reduction is already complete within each shard
-  (e.g. an explicit reduce over a sharded axis).
-
-**Propagation.** Per input mesh axis, by its attr:
-
-1. `Split(k)` — map cute axis `k` to the input's logical tensor axis,
-   then to a domain dim via the input access map.
-2. If that domain dim appears in the output access map, the output
-   carries `Split` on the **output layout axis** the domain dim maps to.
-3. If that domain dim is a reduction dim, the output mesh axis becomes
-   `Partial(reduction)` when the effect is `partial`, or `Broadcast`
-   when the effect is `complete`. The resulting `Partial` carries no
-   cute axis — it is a value state on that mesh axis.
-4. `Partial(reduction)` input — propagates on the **same mesh axis**:
-   propagate unchanged when the dataflow is homogeneous in `reduction`;
-   resolve to `Broadcast` via an explicit reduction / allreduce over that
-   axis; error on a non-homogeneous use or an unreduced function
-   output / return. There is no cute-axis mapping for a `Partial`.
-5. A `Broadcast` (size-1) input axis contributes no `Split`.
-6. Two inputs binding the same domain dim to incompatible mesh axes is
-   an error.
-
-A `Partial` MUST NOT be silently eliminated by an ordinary op
-(no silent loss); only an explicit `Reshard` / allreduce from `Partial`
-to `Broadcast` completes it.
-
-A fully-`Broadcast` input `ShardLayout` (every attr `Broadcast`) is
-**replicated**: it carries no real sharding, so it contributes no
-`Split` / `Partial` and does not pin a mesh — it MAY combine with an
-input sharded on a different mesh. When no input carries real sharding
-the output carries none.
-
-An input `Split` that accesses a non-projection domain dim, or an
-output-surviving dim reachable only through a non-projection output
-access, MUST **fail closed** rather than guess a mapping. The rule
-reads only the access maps' affine structure (which domain dim each
-axis uses), never the domain bounds, so it is size-agnostic and
-identical for static and dynamic shapes.
-
-**Owner axis.** `Split(axis)` indexes an **output layout (cute) axis**,
-not the logical tensor axis. A reduction-induced `Partial` attaches to no
-cute axis — it is a value state on the mesh axis that was reduced.
+`ShardLayout` here is the data model that the analysis services read and
+produce. Logical-shape-to-layout-domain interpretation and relation-driven
+shard propagation are owned by [analysis §3](./analysis.md#3-shard-propagation):
+logical shape → layout domain in
+[analysis §3.1](./analysis.md#31-logical-shape-to-layout-domain), and
+relation-driven propagation in
+[analysis §3.2](./analysis.md#32-relation-driven-shard-propagation).
