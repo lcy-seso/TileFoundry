@@ -47,6 +47,8 @@ class UnaryKind(enum.Enum):
     NOT = "not"
     RELU = "relu"
     SQUARE = "square"
+    EXP = "exp"
+    LOG = "log"
 
 
 class ReduceKind(enum.Enum):

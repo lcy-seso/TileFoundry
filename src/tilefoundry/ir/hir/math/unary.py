@@ -50,6 +50,8 @@ def _eval_unary(ctx):
         UnaryKind.RELU: torch.relu,
         UnaryKind.SQUARE: torch.square,
         UnaryKind.RSQRT: torch.rsqrt,
+        UnaryKind.EXP: torch.exp,
+        UnaryKind.LOG: torch.log,
     }
     return TensorValue(data=fns[ctx.op.kind](ctx.args[0].data), type=ctx.result_type)
 

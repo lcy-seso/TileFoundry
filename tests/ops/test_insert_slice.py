@@ -2,19 +2,18 @@
 loop-carry lowering exercised through a single decode step.
 
 ``insert_slice(dst, update, offsets)`` returns ``dst`` with ``update`` written
-into the window starting at ``offsets``. The 1-D case takes a single scalar
-start (a rank-0 integer tensor or an integer literal); higher rank shares the
-surface and is rejected at typeinfer. The decode-step tests exercise the
-loop-carry lowering (grid-region carry, full_like, tuple_get_item, cache_update,
-in-place insert_slice) and the cross-CTA reshard-owned sync.
+into the per-axis window at ``offsets``. A rank-1 dst takes a single scalar
+start (a rank-0 integer tensor or an integer literal); a rank-N dst takes a
+tuple of per-axis rank-0 offsets (literals or runtime scalars). The decode-step
+tests exercise the loop-carry lowering (grid-region carry, full_like,
+tuple_get_item, cache_update, in-place insert_slice) and the cross-CTA
+reshard-owned sync.
 """
 from __future__ import annotations
 
 import pytest
 import torch
 
-from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
-from tilefoundry.ir.types import DType
 from tests.ops.eval_utils import EvalCase, run_eval_case
 from tests.ops.typeinfer_utils import (
     ExpectedError,
@@ -22,10 +21,84 @@ from tests.ops.typeinfer_utils import (
     run_typeinfer_case,
     ten,
 )
+from tilefoundry.evaluator import evaluate
+from tilefoundry.ir.core import Call, Constant, Tuple, Var
+from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
+from tilefoundry.ir.types import DType, TensorType, TupleType
+from tilefoundry.parser.hir_parser import parse_script
+from tilefoundry.visitor_registry.contexts import TypeInferContext
+from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 _F = DType.f32
 _I = DType.i32
 _OP = InsertSlice()
+
+_SI64 = TensorType(shape=(), dtype=DType.i64, layout=None, storage="gmem")
+_SI32 = TensorType(shape=(), dtype=DType.i32, layout=None, storage="gmem")
+
+
+def _lit(v: int) -> Constant:
+    """A compile-time literal offset (rank-0 i64 Constant)."""
+    return Constant(value=v, type=_SI64)
+
+
+def _rt(name: str = "p") -> Var:
+    """A runtime offset (rank-0 i32 Var)."""
+    return Var(type=_SI32, name=name)
+
+
+def _offsets(*elems) -> Tuple:
+    return Tuple(type=TupleType(fields=tuple(e.type for e in elems)), elements=tuple(elems))
+
+
+def _infer_insert(dst_ty, upd_ty, offsets_expr):
+    call = Call(
+        type=dst_ty,
+        target=InsertSlice(),
+        args=(Var(type=dst_ty, name="dst"), Var(type=upd_ty, name="upd"), offsets_expr),
+    )
+    return TypeInferVisitor(TypeInferContext()).visit(call)
+
+
+_DSL_PRELUDE = (
+    "from __future__ import annotations\n"
+    "from tilefoundry import func\n"
+    "from tilefoundry.dsl import Tensor, tf\n"
+    "\n"
+)
+
+
+def _eval_rankn(dst: torch.Tensor, upd: torch.Tensor, lit_offsets, runtime_axis=None):
+    """Evaluate a rank-N insert_slice through the parsed DSL surface.
+    ``lit_offsets`` are per-axis literals; if ``runtime_axis`` is given, that
+    axis's offset is a runtime rank-0 i32 param carrying
+    ``lit_offsets[runtime_axis]`` instead."""
+    d = ", ".join(str(int(x)) for x in dst.shape)
+    u = ", ".join(str(int(x)) for x in upd.shape)
+    extra_params, inputs, elems = [], [dst, upd], []
+    for ax, o in enumerate(lit_offsets):
+        if ax == runtime_axis:
+            extra_params.append(f'o{ax}: Tensor[(), "i32"]')
+            inputs.append(torch.tensor(int(o), dtype=torch.int32))
+            elems.append(f"o{ax}")
+        else:
+            elems.append(str(int(o)))
+    extra = "".join(f", {p}" for p in extra_params)
+    src = (
+        _DSL_PRELUDE + "@func\n"
+        f'def ins(dst: Tensor[({d}), "f32"], upd: Tensor[({u}), "f32"]{extra}) -> Tensor[({d}), "f32"]:\n'
+        f"    return tf.insert_slice(dst, upd, ({', '.join(elems)}))\n"
+    )
+    return evaluate(parse_script(src), *inputs, device="cpu")
+
+
+def _ref_scatter(dst, upd, offsets):
+    import builtins  # noqa: PLC0415 -- `from tf import *` shadows the builtin `slice`
+
+    ref = dst.clone()
+    sl = tuple(builtins.slice(o, o + upd.shape[ax]) for ax, o in enumerate(offsets))
+    ref[sl] = upd
+    return ref
 
 CASES = [
     # 1-D window with a rank-0 scalar offset: returns dst's type unchanged.
@@ -63,12 +136,13 @@ CASES = [
         (ten((8,), _F), ten((2, 4), _F), ten((), _I)),
         ExpectedError("update rank .* must equal dst rank", exc=TypeError),
     ),
-    # N-D not implemented yet (same surface).
+    # A bare scalar offset applies only to a rank-1 dst; a multi-D dst needs a
+    # per-axis offset tuple.
     TypeInferCase(
-        "nd_not_implemented",
+        "nd_scalar_offset_rejected",
         _OP,
         (ten((4, 8), _F), ten((1, 8), _F), ten((), _I)),
-        ExpectedError("only the 1-D case", exc=NotImplementedError),
+        ExpectedError("per-axis offset tuple", exc=TypeError),
     ),
     # A rank-1 vector offset is not a rank-0 scalar start for the 1-D case.
     TypeInferCase(
@@ -119,6 +193,83 @@ CASES = [
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_insert_slice_typeinfer(case):
     run_typeinfer_case(case)
+
+
+# ── rank-N per-axis offset tuple (typeinfer) ──────────────────────────────
+
+def test_insert_slice_rankn_tuple_returns_dst_type():
+    """A rank-3 window with an all-literal in-bounds offset tuple returns the
+    dst type unchanged."""
+    out = _infer_insert(
+        ten((1, 16512, 512), _F), ten((1, 1, 512), _F), _offsets(_lit(0), _lit(5), _lit(0))
+    )
+    assert out.shape == (1, 16512, 512) and out.dtype == _F
+
+
+def test_insert_slice_rankn_static_oob_names_axis():
+    """An all-literal offset that puts the window past dst on one axis is
+    rejected at typeinfer, and the error names the offending axis."""
+    with pytest.raises(TypeError, match="axis 1"):
+        _infer_insert(
+            ten((1, 16512, 512), _F),
+            ten((1, 1, 512), _F),
+            _offsets(_lit(0), _lit(16512), _lit(0)),  # 16512 + 1 > 16512 on axis 1
+        )
+
+
+def test_insert_slice_rankn_negative_literal_rejected():
+    with pytest.raises(TypeError, match="axis 1"):
+        _infer_insert(
+            ten((1, 16512, 512), _F),
+            ten((1, 1, 512), _F),
+            _offsets(_lit(0), _lit(-1), _lit(0)),
+        )
+
+
+def test_insert_slice_rankn_runtime_member_deferred():
+    """A runtime offset member is not statically checkable; typeinfer accepts it
+    (deferred to eval) while the literal members are still bounds-checked."""
+    out = _infer_insert(
+        ten((1, 16512, 512), _F), ten((1, 1, 512), _F), _offsets(_lit(0), _rt(), _lit(0))
+    )
+    assert out.shape == (1, 16512, 512)
+
+
+def test_insert_slice_tuple_len_must_equal_rank():
+    with pytest.raises(TypeError, match="tuple length"):
+        _infer_insert(
+            ten((1, 16512, 512), _F), ten((1, 1, 512), _F), _offsets(_lit(0), _lit(0))
+        )
+
+
+# ── rank-N per-axis offset tuple (evaluation) ─────────────────────────────
+
+def test_insert_slice_rankn_eval_matches_reference_scatter():
+    """AC oracle: a rank-3 window at ``(0, P%128, 0)`` (the middle offset a
+    runtime member) evaluates to the same tensor as a reference scatter."""
+    torch.manual_seed(0)
+    dst = torch.randn(1, 16512, 512)
+    upd = torch.randn(1, 1, 512)
+    p = 640 % 128  # a runtime middle-axis offset
+    out = _eval_rankn(dst, upd, (0, p, 0), runtime_axis=1)
+    torch.testing.assert_close(out, _ref_scatter(dst, upd, (0, p, 0)))
+
+
+def test_insert_slice_rankn_eval_all_literal():
+    torch.manual_seed(1)
+    dst = torch.randn(2, 8, 4)
+    upd = torch.randn(1, 3, 4)
+    out = _eval_rankn(dst, upd, (1, 2, 0))
+    torch.testing.assert_close(out, _ref_scatter(dst, upd, (1, 2, 0)))
+
+
+def test_insert_slice_rankn_eval_runtime_oob_raises():
+    """A runtime offset member that puts the window out of bounds is caught by
+    the eval guard (typeinfer cannot see the runtime value)."""
+    dst = torch.zeros(1, 8, 4)
+    upd = torch.zeros(1, 3, 4)
+    with pytest.raises(ValueError, match="out of bounds"):
+        _eval_rankn(dst, upd, (0, 6, 0), runtime_axis=1)  # 6 + 3 > 8 on axis 1
 
 
 def _ref(dst, upd, start):
@@ -185,9 +336,8 @@ from tilefoundry.dsl.storage import gmem  # noqa: E402
 from tilefoundry.dsl.tf import *  # noqa: E402,F401,F403
 from tilefoundry.ir.core.module import Module  # noqa: E402
 from tilefoundry.ir.tir.memory.alloc_tensor import AllocTensor  # noqa: E402
-from tilefoundry.ir.tir.memory.tensor_view import TensorView as TirTensorView  # noqa: E402
 from tilefoundry.ir.tir.memory.copy import Copy as TirCopy  # noqa: E402
-from tilefoundry.ir.tir.sync import Sync as TirSync  # noqa: E402
+from tilefoundry.ir.tir.memory.tensor_view import TensorView as TirTensorView  # noqa: E402
 from tilefoundry.ir.tir.stmts import (  # noqa: E402
     Evaluate,
     For,
@@ -415,4 +565,58 @@ def test_insert_slice_dynamic_offset() -> None:
 
     exp = torch.zeros(_DYN_D, device="cuda")
     exp[:_DYN_K] = v[0]  # positions 0..K-1 each written with v at offset i
+    assert torch.allclose(out, exp, rtol=1e-4, atol=1e-4), (out - exp).abs().max()
+
+
+# ── rank-N insert_slice end-to-end on GPU: per-axis window + coords ────────
+#
+# A non-contiguous per-axis window (partial inner axis) written at a dynamic,
+# non-zero middle-axis coordinate. This is the numerical gate for the rank-N
+# codegen: it fails if the emitter drops trailing coordinates (writes at the
+# wrong axis) or flat-collapses the window shape (a partial inner axis is not
+# contiguous in the flattened buffer).
+_NW_A, _NW_B, _NW_C = 1, 4, 6
+_NW_UB, _NW_UC = 2, 3  # window extent on axis 1 / axis 2 (partial: 3 of 6)
+_NW_STEPS = 2
+
+
+@module(entry="nd_window")
+class _NdWindow:
+    """A loop-carried rank-3 in-place ``insert_slice`` writing a non-trivial,
+    non-contiguous window (full axis 0, window 2 on axis 1, partial 3-of-6 on
+    axis 2) at the induction variable as the middle-axis tile coordinate."""
+
+    @func(topologies=(Topology("thread", 1),))
+    def nd_window(
+        base: Tensor[(_NW_A, _NW_B, _NW_C), "f32"],
+        v: Tensor[(_NW_A, _NW_UB, _NW_UC), "f32"],
+    ):
+        with Mesh(Topology("thread", 1), (1,), ("t",)) as m:
+            br = reshard(base, (_NW_A, _NW_B, _NW_C @ m.t), "rmem")
+            vr = reshard(v, (_NW_A, _NW_UB, _NW_UC @ m.t), "rmem")
+            acc = full_like(br, 0.0)
+            for i in tile(_NW_STEPS):
+                acc = insert_slice(acc, vr, (0, i, 0))
+            return reshard(acc, (_NW_A, _NW_B, _NW_C @ m.t), "gmem")
+
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_insert_slice_rankn_gpu_oracle() -> None:
+    """The rank-N in-place ``insert_slice`` runs on GPU and matches a torch
+    scatter reference: a non-contiguous window at a dynamic, non-zero
+    middle-axis coordinate."""
+    import tilefoundry  # noqa: PLC0415
+
+    rm = tilefoundry.compile(_NdWindow, target="cuda")
+    base = torch.randn(_NW_A, _NW_B, _NW_C, device="cuda")
+    v = torch.randn(_NW_A, _NW_UB, _NW_UC, device="cuda")
+    out = torch.empty(_NW_A, _NW_B, _NW_C, device="cuda")
+    rm(base, v, out)
+    torch.cuda.synchronize()
+
+    exp = torch.zeros(_NW_A, _NW_B, _NW_C, device="cuda")
+    for i in range(_NW_STEPS):
+        exp[:, _NW_UB * i : _NW_UB * i + _NW_UB, 0:_NW_UC] = v
     assert torch.allclose(out, exp, rtol=1e-4, atol=1e-4), (out - exp).abs().max()

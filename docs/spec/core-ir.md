@@ -145,7 +145,7 @@ class Constant(Expr):
     value: object  # a literal; a scalar is a rank-0 TensorType
 
 class Tuple(Expr):
-    fields: tuple[Expr, ...]  # value-level multi-output aggregate; type is TupleType
+    elements: tuple[Expr, ...]  # value-level multi-output aggregate; type is TupleType
 ```
 
 - constraints:
@@ -222,8 +222,11 @@ surface names share a single kinded IR class without exposing the
 `kind=...` attribute at the call site.
 
 ```python
-@register_alias(dialect: str, category: str, name: str, params: list[ParamDef])  # surface-registry coordinates; params reuses the target Op's static ParamDef references
-def builder() -> Op: ...    # returns a target Op with attributes pre-fixed; takes attribute kwargs only
+# Registry coordinates select the surface bucket; ``params`` reuses the
+# target Op's static ParamDef references.
+@register_alias(dialect="...", category="...", name="...", params=[...])
+def builder() -> Op:
+    """Return a target Op with attributes pre-fixed; takes attribute kwargs only."""
 ```
 
 - constraints:

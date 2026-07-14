@@ -8,7 +8,7 @@ import logging
 import textwrap
 from typing import Any, Literal
 
-from tilefoundry.ir.core import Call, Constant, Expr, Op, TypeInferContext, VerifyError
+from tilefoundry.ir.core import Call, Constant, Expr, Op, Tuple, TypeInferContext, VerifyError
 from tilefoundry.ir.core.op_registry import _first_schema
 from tilefoundry.ir.core.op_schema import OpSchema
 from tilefoundry.ir.hir.math.binary import Binary
@@ -117,6 +117,12 @@ class BaseExprVisitor:
         # the user did not supply ``loc=...`` and there is no single LHS name
         # to fall back on.
         self._call_dsl_names: dict[int, str] = {}
+
+    def _tuple_expr_expr(self, node: ast.Tuple):
+        """Build a ``Tuple`` from an AST tuple literal."""
+        elements = tuple(self.expr(e) for e in node.elts)
+        field_types = tuple(e.type for e in elements)
+        return Tuple(type=TupleType(fields=field_types), elements=elements)
 
     def _resolve_body_mesh(self, name: str):
         """Resolve a mesh by variable name from the lexical env only.
@@ -540,7 +546,18 @@ class BaseExprVisitor:
         else:
             for i, arg in enumerate(pos_args):
                 if i < len(input_params):
-                    input_args.append(self.expr(arg))
+                    if (
+                        isinstance(arg, ast.Tuple)
+                        and schema.name == "insert_slice"
+                        and input_params[i].name == "offsets"
+                    ):
+                        # Narrow route: only ``insert_slice``'s per-axis offset
+                        # tuple is lifted to an explicit core Tuple of
+                        # scalar Exprs. Any other input keeps the default path,
+                        # so a tuple literal there is rejected.
+                        input_args.append(self._tuple_expr_expr(arg))
+                    else:
+                        input_args.append(self.expr(arg))
                 else:
                     attr_idx = i - len(input_params)
                     if attr_idx >= len(attr_params):

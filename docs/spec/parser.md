@@ -45,6 +45,7 @@ function. `@func` parses with dispatch token `"hir"`, `@prim_func`
 with `"tir"`.
 
 ```python
+# example
 @tilefoundry.module(entry="f")
 class M:
     @tilefoundry.func
@@ -61,6 +62,7 @@ shape through `Function.specialize`. The base function is defined with
 with `@base.specialize(pattern)`:
 
 ```python
+# example
 S = DimVar("S", 1, 9)                                          # envelope [1, 9) = 1..8
 
 @tilefoundry.func
@@ -360,8 +362,7 @@ def _register_schema(schema: OpSchema) -> None: ...
 def get_schemas(dialect: str, name: str) -> list[OpSchema]: ...
 def iter_schema_names(dialect: str) -> Iterable[str]: ...
 
-# tilefoundry/ir/core/op_schema.py
-@dataclass(frozen=True)
+# tilefoundry/ir/core/op_schema.py — a frozen dataclass
 class OpSchema:
     dialect: str            # "tf" or "T"
     name: str
@@ -735,6 +736,7 @@ Python statements that the parser folds into a single `Expr` tree.
 | `for i in tile(...)` | `GridRegionExpr` (see §1.7 and below). |
 | `with Mesh(...) as m` | Push `m` onto the parser-lexical stack; pop on exit. No IR node. |
 | `return expr` | Sets `Function.body`. A `return` without a value is rejected. |
+| `return (a, b)` / `return a, b` | A literal tuple return (both spellings are the same AST) folds to a core `Tuple` body ([core-ir §2.2](./core-ir.md)); `Function.return_type` is the `TupleType` of the element types. Callers destructure via the existing tuple-unpack rule (`o, s = f(...)`). |
 | `pass` | Accepted only as the **entire** body: sets `Function.body = None`, declaring a dispatch prototype whose implementations are registered via `.specialize` (§8). A `pass` mixed with any other statement is rejected. |
 
 `for` / `if` / `while` over arbitrary ranges, conditionals, and other

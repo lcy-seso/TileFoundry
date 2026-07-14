@@ -4,8 +4,9 @@ Constructs a logical tensor view over a memory source
 (tensor / ptr / span). ``layout`` can be a plain ``Layout`` (→ plain view)
 or a ``ShardLayout`` (→ shard tensor view, no allocation).
 
-When called with a second arg (index Var), emits a row-slice view:
-``cute::local_tile(x, make_shape(K), make_coord(index))``.
+A slice view carries a coordinate per axis after the memory source: a single
+coordinate is a flat window (cache_update / 1-D insert_slice), multiple
+coordinates are a per-axis N-D window (rank-N insert_slice).
 """
 
 from __future__ import annotations
@@ -47,14 +48,27 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         storage=src_ty.storage,
     )
 
-def layout_for_slice(src_shape: tuple, axis: int, sliced_shape: tuple) -> Layout:
-    """Compute a plain Layout for a slice view."""
-    rank = len(src_shape)  # noqa: F841
+def _c_order_strides(src_shape: tuple) -> list:
+    """C-order contiguous strides of the source buffer a slice view reads."""
     strides = [1]
     for s in reversed(src_shape[1:]):
         strides.insert(0, strides[0] * s)
-    view_strides = list(strides)
+    return strides
+
+
+def layout_for_slice(src_shape: tuple, axis: int, sliced_shape: tuple) -> Layout:
+    """Compute a plain Layout for a slice view."""
+    view_strides = _c_order_strides(src_shape)
     view_strides.pop(axis)
     return Layout(shape=sliced_shape, strides=tuple(view_strides))
 
 TensorView.layout_for_slice = staticmethod(layout_for_slice)
+
+
+def layout_for_slice_nd(src_shape: tuple, sliced_shape: tuple) -> Layout:
+    """Plain Layout for an N-D window: the sub-block keeps the source's C-order
+    strides, so it is a strided view of the original buffer (all axes retained,
+    each shrunk to the window extent)."""
+    return Layout(shape=sliced_shape, strides=tuple(_c_order_strides(src_shape)))
+
+TensorView.layout_for_slice_nd = staticmethod(layout_for_slice_nd)

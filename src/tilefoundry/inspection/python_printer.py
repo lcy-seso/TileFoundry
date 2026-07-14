@@ -7,9 +7,10 @@ are emitted; otherwise the verbose ``ShardLayout(...)`` form is used.
 
 from __future__ import annotations
 
+import enum
 import re
 
-from tilefoundry.ir.core import Call, Constant, Expr, Var
+from tilefoundry.ir.core import Call, Constant, Expr, Tuple, Var
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.pattern import DimVarRangePat, Pattern
 from tilefoundry.ir.hir.function import Function as HirFunction
@@ -17,7 +18,7 @@ from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.target.storage import StorageKind
-from tilefoundry.ir.types import DType, TensorType
+from tilefoundry.ir.types import DType, TensorType, TupleType
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimConst,
@@ -388,6 +389,7 @@ def _build_kinded_alias_maps():
         },
         {
             UnaryKind.NEG: "neg", UnaryKind.ABS: "abs", UnaryKind.NOT: "logical_not",
+            UnaryKind.EXP: "exp", UnaryKind.LOG: "log",
         },
     )
 
@@ -423,6 +425,9 @@ def _collect_meshes(fn: HirFunction) -> dict[int, Mesh]:
                 _add_layout(expr.target.layout)
             for arg in expr.args:
                 _walk(arg)
+        elif isinstance(expr, Tuple):
+            for el in expr.elements:
+                _walk(el)
 
     _walk(fn.body)
     return meshes
@@ -473,6 +478,9 @@ def _emit_def(
         if isinstance(expr, Call):
             for arg in expr.args:
                 _topo(arg)
+        elif isinstance(expr, Tuple):
+            for el in expr.elements:
+                _topo(el)
         _order.append(expr)
 
     _topo(fn.body)
@@ -511,13 +519,28 @@ def _emit_def(
     for expr in _order:
         _assign_name(expr)
 
-    # Function signature
+    def _tuple_literal(elements) -> str:
+        inner = ", ".join(_names[id(el)] for el in elements)
+        if len(elements) == 1:
+            inner += ","
+        return f"({inner})"
+
+    def _arg_ref(a) -> str:
+        # A tuple-valued input (e.g. insert_slice's per-axis offsets) renders
+        # inline as a literal so the parser's narrow route lifts it back to a
+        # core Tuple on re-parse.
+        return _tuple_literal(a.elements) if isinstance(a, Tuple) else _names[id(a)]
+
+    # Function signature. A ``TupleType`` return has no surface annotation; it
+    # is re-inferred from the literal tuple ``return`` body on re-parse.
     return_ty = fn.return_type
-    ret_str = (
-        _tensor_annotation(return_ty, mesh_name_map=mesh_map, indent=indent)
-        if isinstance(return_ty, TensorType)
-        else "None"
-    )
+    arrow = ""
+    if isinstance(return_ty, TensorType):
+        arrow = " -> " + _tensor_annotation(
+            return_ty, mesh_name_map=mesh_map, indent=indent
+        )
+    elif not isinstance(return_ty, TupleType):
+        arrow = " -> None"
 
     lines.append(f"def {def_name}(")
     param_strs = []
@@ -529,7 +552,7 @@ def _emit_def(
         else:
             param_strs.append(f"{indent}{name}")
     lines.append(",\n".join(param_strs))
-    lines.append(f") -> {ret_str}:")
+    lines.append(f"){arrow}:")
 
     # A dispatch prototype has no body — declare signature only.
     if fn.body is None:
@@ -542,6 +565,12 @@ def _emit_def(
         if isinstance(expr, Constant):
             name = _names[id(expr)]
             lines.append(f"{indent}{name} = {repr(expr.value)}")
+            continue
+        if isinstance(expr, Tuple):
+            # A tuple is rendered inline at its use site: as a literal argument
+            # (op input) or by the ``return`` statement (function body). The
+            # parser lifts an inline offset tuple back to a core Tuple, whereas a
+            # hoisted ``name = (...)`` binding would not re-parse.
             continue
         if isinstance(expr, Call):
             name = _names[id(expr)]
@@ -561,14 +590,14 @@ def _emit_def(
                     f", storage={target.storage.name.lower()}"
                     if target.storage is not None else ""
                 )
-                loc = f'  # loc="{expr.loc}"' if expr.loc else ""
+                loc = f'  # loc="{name}"' if expr.loc else ""
                 lines.append(
                     f"{indent}{name} = reshard({src_name}{layout_kw}{storage}){loc}"
                 )
             else:
                 # Generic op: op_name(arg1, arg2, ..., attr=val)
                 op_name_str = _op_name(target)
-                arg_names = [_names[id(a)] for a in expr.args]
+                arg_names = [_arg_ref(a) for a in expr.args]
                 args_str = ", ".join(arg_names)
 
                 # Extract keyword attributes from the op.
@@ -598,6 +627,12 @@ def _emit_def(
                 for k, v in attrs.items():
                     if isinstance(v, str):
                         attr_strs.append(f'{k}="{v}"')
+                    elif isinstance(v, enum.Enum) and isinstance(v.value, str):
+                        # A string-valued enum attribute (ReduceKind / DType /
+                        # ...) prints as its DSL string value so the source
+                        # re-parses without a bare enum reference — the parser
+                        # promotes the string back via the ParamDef annotation.
+                        attr_strs.append(f'{k}="{v.value}"')
                     elif isinstance(v, float):
                         attr_strs.append(f"{k}={v!r}")
                     elif isinstance(v, ShardLayout):
@@ -615,12 +650,16 @@ def _emit_def(
                     call_str += ", " + ", ".join(attr_strs)
                 call_str += ")"
 
-                loc = f'  # loc="{expr.loc}"' if expr.loc else ""
+                loc = f'  # loc="{name}"' if expr.loc else ""
                 lines.append(f"{indent}{name} = {call_str}{loc}")
 
-    # Return statement
-    body_name = _names[id(fn.body)]
-    lines.append(f"{indent}return {body_name}")
+    # Return statement. A literal tuple body renders its elements inline
+    # (``return (e0, e1)``) rather than a name for the un-emitted Tuple node.
+    if isinstance(fn.body, Tuple):
+        lines.append(f"{indent}return {_tuple_literal(fn.body.elements)}")
+    else:
+        body_name = _names[id(fn.body)]
+        lines.append(f"{indent}return {body_name}")
     return lines
 
 
