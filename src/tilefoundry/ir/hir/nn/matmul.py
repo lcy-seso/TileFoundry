@@ -17,7 +17,8 @@ from tilefoundry.visitor_registry.access_relation import (
     build_relation,
     register_type_relation,
 )
-from tilefoundry.visitor_registry.relation_build import build_domain, shape_from_relation
+from tilefoundry.visitor_registry.isl_utility import to_domain
+from tilefoundry.visitor_registry.relation_build import shape_from_relation
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 from ..math._helpers import resolve_anchor_storage
@@ -77,7 +78,7 @@ def _matmul_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
     out_batch = _broadcast_batch(lhs_batch, rhs_batch)
     b = len(out_batch)
     m, k, n = lhs.shape[-2], lhs.shape[-1], rhs.shape[-1]
-    domain = build_domain((*out_batch, m, n, k))
+    domain, param_map = to_domain((*out_batch, m, n, k))
 
     m_d, n_d, k_d = b, b + 1, b + 2
     in_dims = [f"d{i}" for i in range(b + 3)]
@@ -104,7 +105,7 @@ def _matmul_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
         isl.map(f"{{ {src} -> [{', '.join(dst)}] }}")
         for dst in (lhs_out, rhs_out, out_out)
     )
-    return AccessRelationResult(domain=domain, maps=maps)
+    return AccessRelationResult(domain=domain, maps=maps, param_map=param_map)
 
 
 @register_typeinfer(MatMul)
@@ -137,7 +138,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     # Output shape comes from the relation (domain + output map), not a separate
     # hand-written rule: output axes are [batch.., M, N] (K reduced); the K
     # domain dim and N output axis fall out of the output shape's rank.
-    out_shape = shape_from_relation((lhs, rhs), relation)
+    out_shape = shape_from_relation(relation)
     k_domain_dim = len(out_shape)
     try:
         shard = derive_output_shard_layout(
