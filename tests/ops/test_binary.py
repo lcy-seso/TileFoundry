@@ -14,10 +14,8 @@ from tests.ops.eval_utils import EvalCase, run_eval_case
 from tests.ops.typeinfer_utils import (
     ExpectedError,
     TypeInferCase,
-    mesh,
+    infer_call,
     run_typeinfer_case,
-    sharded,
-    ten,
 )
 from tilefoundry import func
 from tilefoundry.dsl import Tensor, tf
@@ -26,8 +24,9 @@ from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.target.storage import StorageKind
-from tilefoundry.ir.types import DType
+from tilefoundry.ir.types import DType, make_shard_tensor_type, make_tensor_type
 from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.ir.types.shard import make_mesh
 from tilefoundry.ir.types.shard.shard_layout import Broadcast, Split
 
 _ADD = Binary(kind=BinaryKind.ADD)
@@ -35,25 +34,25 @@ _F = DType.f32
 
 # A single-axis mesh (g=4) for flat shards and a two-axis mesh (a=2, b=4) for
 # factorized shards; cases reuse these so no test hand-builds a Mesh.
-_M = mesh((4,))
-_MAB = mesh((2, 4), ("a", "b"))
+_M = make_mesh((4,))
+_MAB = make_mesh((2, 4), ("a", "b"))
 
 CASES = [
     # ── shape inference (unsharded) ──────────────────────────────────────────
-    TypeInferCase("same_shape", _ADD, (ten((4, 8), _F), ten((4, 8), _F)), ten((4, 8), _F)),
-    TypeInferCase("size1_broadcast", _ADD, (ten((4, 8), _F), ten((1, 8), _F)), ten((4, 8), _F)),
-    TypeInferCase("different_rank_broadcast", _ADD, (ten((4, 8), _F), ten((8,), _F)), ten((4, 8), _F)),
-    TypeInferCase("scalar_broadcast", _ADD, (ten((), _F), ten((4, 8), _F)), ten((4, 8), _F)),
+    TypeInferCase("same_shape", _ADD, (make_tensor_type((4, 8), _F), make_tensor_type((4, 8), _F)), make_tensor_type((4, 8), _F)),
+    TypeInferCase("size1_broadcast", _ADD, (make_tensor_type((4, 8), _F), make_tensor_type((1, 8), _F)), make_tensor_type((4, 8), _F)),
+    TypeInferCase("different_rank_broadcast", _ADD, (make_tensor_type((4, 8), _F), make_tensor_type((8,), _F)), make_tensor_type((4, 8), _F)),
+    TypeInferCase("scalar_broadcast", _ADD, (make_tensor_type((), _F), make_tensor_type((4, 8), _F)), make_tensor_type((4, 8), _F)),
     TypeInferCase(
         "dynamic_dim",
         _ADD,
-        (ten((DimVar("N", 1, 64), 8), _F), ten((DimVar("N", 1, 64), 8), _F)),
-        ten((DimVar("N", 1, 64), 8), _F),
+        (make_tensor_type((DimVar("N", 1, 64), 8), _F), make_tensor_type((DimVar("N", 1, 64), 8), _F)),
+        make_tensor_type((DimVar("N", 1, 64), 8), _F),
     ),
     TypeInferCase(
         "dtype_mismatch",
         _ADD,
-        (ten((4, 8), _F), ten((4, 8), DType.bf16)),
+        (make_tensor_type((4, 8), _F), make_tensor_type((4, 8), DType.bf16)),
         ExpectedError(match="dtype mismatch"),
     ),
     # ── shard propagation ────────────────────────────────────────────────────
@@ -61,42 +60,35 @@ CASES = [
     TypeInferCase(
         "sharded_lhs_replicated_rhs",
         _ADD,
-        (sharded((16, 8), (Split(0),), _M), ten((16, 8), _F)),
-        sharded((16, 8), (Split(0),), _M),
+        (make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)), make_tensor_type((16, 8), _F)),
+        make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)),
     ),
     # both split the same axis identically → that split.
     TypeInferCase(
         "both_split_same_axis",
         _ADD,
-        (sharded((16, 8), (Split(0),), _M), sharded((16, 8), (Split(0),), _M)),
-        sharded((16, 8), (Split(0),), _M),
+        (
+            make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)),
+            make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)),
+        ),
+        make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)),
     ),
     # split side + broadcast side: lhs (4,8) split axis 0, rhs (8,) broadcasts.
     TypeInferCase(
         "split_side_plus_broadcast_side",
         _ADD,
-        (sharded((4, 8), (Split(0),), _M), ten((8,), _F)),
-        sharded((4, 8), (Split(0),), _M),
-    ),
-    # lower-rank split rhs / lhs right-aligns to output axis 1.
-    TypeInferCase(
-        "lower_rank_rhs_split",
-        _ADD,
-        (ten((4, 8), _F), sharded((8,), (Split(0),), _M)),
-        sharded((4, 8), (Split(1),), _M),
-    ),
-    TypeInferCase(
-        "lower_rank_lhs_split",
-        _ADD,
-        (sharded((8,), (Split(0),), _M), ten((4, 8), _F)),
-        sharded((4, 8), (Split(1),), _M),
+        (make_shard_tensor_type((4, 8), mesh=_M, attrs=(Split(0),)), make_tensor_type((8,), _F)),
+        make_shard_tensor_type((4, 8), mesh=_M, attrs=(Split(0),)),
     ),
     # lhs splits axis 0, rhs splits axis 1 on the same mesh axis → conflict,
     # not a silent lhs pick.
     TypeInferCase(
         "incompatible_split",
         _ADD,
-        (sharded((16, 8), (Split(0),), _M), sharded((16, 8), (Split(1),), _M)),
+        (
+            make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)),
+            make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(1),)),
+        ),
         ExpectedError(match="incompatible"),
     ),
     # two mesh axes split the same tensor axis (neither operand supplies both):
@@ -105,17 +97,20 @@ CASES = [
         "two_mesh_axes_synthesize_factorized",
         _ADD,
         (
-            sharded((8,), (Split(0), Broadcast()), _MAB),
-            sharded((8,), (Broadcast(), Split(0)), _MAB),
+            make_shard_tensor_type((8,), mesh=_MAB, attrs=(Split(0), Broadcast())),
+            make_shard_tensor_type((8,), mesh=_MAB, attrs=(Broadcast(), Split(0))),
         ),
-        sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)),
+        make_shard_tensor_type((8,), mesh=_MAB, attrs=(Split(0), Split(0))),
     ),
     # one operand already carries the full factorized layout → carried through.
     TypeInferCase(
         "factorized_input_passes_through",
         _ADD,
-        (sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)), ten((8,), _F)),
-        sharded((8,), (Split(0), Split(1)), _MAB, cute=(2, 4)),
+        (
+            make_shard_tensor_type((8,), mesh=_MAB, attrs=(Split(0), Split(0))),
+            make_tensor_type((8,), _F),
+        ),
+        make_shard_tensor_type((8,), mesh=_MAB, attrs=(Split(0), Split(0))),
     ),
     # ── output storage (anchor on concrete residency) ────────────────────────
     # An unmaterialized literal operand (storage=umat) abstains; the concrete
@@ -123,39 +118,39 @@ CASES = [
     TypeInferCase(
         "literal_rhs_anchors_gmem",
         _ADD,
-        (ten((4, 8), _F, storage="gmem"), ten((), _F, storage=StorageKind.UMAT)),
-        ten((4, 8), _F, storage="gmem"),
+        (make_tensor_type((4, 8), _F, storage="gmem"), make_tensor_type((), _F, storage=StorageKind.UMAT)),
+        make_tensor_type((4, 8), _F, storage="gmem"),
     ),
     TypeInferCase(
         "literal_lhs_anchors_gmem",
         _ADD,
-        (ten((), _F, storage=StorageKind.UMAT), ten((4, 8), _F, storage="gmem")),
-        ten((4, 8), _F, storage="gmem"),
+        (make_tensor_type((), _F, storage=StorageKind.UMAT), make_tensor_type((4, 8), _F, storage="gmem")),
+        make_tensor_type((4, 8), _F, storage="gmem"),
     ),
     TypeInferCase(
         "both_gmem",
         _ADD,
-        (ten((4, 8), _F, storage="gmem"), ten((4, 8), _F, storage="gmem")),
-        ten((4, 8), _F, storage="gmem"),
+        (make_tensor_type((4, 8), _F, storage="gmem"), make_tensor_type((4, 8), _F, storage="gmem")),
+        make_tensor_type((4, 8), _F, storage="gmem"),
     ),
     TypeInferCase(
         "both_rmem",
         _ADD,
-        (ten((4, 8), _F, storage="rmem"), ten((4, 8), _F, storage="rmem")),
-        ten((4, 8), _F, storage="rmem"),
+        (make_tensor_type((4, 8), _F, storage="rmem"), make_tensor_type((4, 8), _F, storage="rmem")),
+        make_tensor_type((4, 8), _F, storage="rmem"),
     ),
     # All operands unmaterialized (e.g. `1 + 1`) → output stays unmaterialized.
     TypeInferCase(
         "all_unmaterialized",
         _ADD,
-        (ten((), _F, storage=StorageKind.UMAT), ten((), _F, storage=StorageKind.UMAT)),
-        ten((), _F, storage=StorageKind.UMAT),
+        (make_tensor_type((), _F, storage=StorageKind.UMAT), make_tensor_type((), _F, storage=StorageKind.UMAT)),
+        make_tensor_type((), _F, storage=StorageKind.UMAT),
     ),
     # Two different concrete residencies have no anchor → error, not a pick.
     TypeInferCase(
         "conflicting_concrete_storage",
         _ADD,
-        (ten((4, 8), _F, storage="gmem"), ten((4, 8), _F, storage="rmem")),
+        (make_tensor_type((4, 8), _F, storage="gmem"), make_tensor_type((4, 8), _F, storage="rmem")),
         ExpectedError(match="conflicting storage"),
     ),
 ]
@@ -164,6 +159,29 @@ CASES = [
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c.name)
 def test_binary_typeinfer(case):
     run_typeinfer_case(case)
+
+
+# ── lower-rank split right-aligns to the output axis ─────────────────────
+# Binary derives the output ShardLayout from the shard-propagation engine
+# (mesh-axis bindings), not by carrying a hand-picked layout literal, so these
+# check which mesh axis holds Split on the (right-aligned) output axis, not
+# the internal layout position count a valid derivation happens to produce.
+
+
+def test_lower_rank_rhs_split_right_aligns():
+    lhs = make_tensor_type((4, 8), _F)
+    rhs = make_shard_tensor_type((8,), mesh=_M, attrs=(Split(0),))
+    out = infer_call(_ADD, lhs, rhs)
+    assert out.shape == (4, 8)
+    assert out.layout.attrs == (Split(1),)
+
+
+def test_lower_rank_lhs_split_right_aligns():
+    lhs = make_shard_tensor_type((8,), mesh=_M, attrs=(Split(0),))
+    rhs = make_tensor_type((4, 8), _F)
+    out = infer_call(_ADD, lhs, rhs)
+    assert out.shape == (4, 8)
+    assert out.layout.attrs == (Split(1),)
 
 
 @pytest.mark.parametrize(
@@ -197,8 +215,8 @@ def test_binary_low_precision_typeinfer_passthrough(dt):
         TypeInferCase(
             f"low_precision_{dt.value}",
             _ADD,
-            (ten((4, 8), dt), ten((4, 8), dt)),
-            ten((4, 8), dt),
+            (make_tensor_type((4, 8), dt), make_tensor_type((4, 8), dt)),
+            make_tensor_type((4, 8), dt),
         )
     )
 
