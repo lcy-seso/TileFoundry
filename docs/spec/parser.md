@@ -356,6 +356,30 @@ nested `GridRegionExpr`; the carry scan recurses into nested loops, so an
 outer-scope name rebound only inside a nested loop is still carried across the
 outer loop (and the nested loop carries it too).
 
+### 1.8 Hard schedule constraints
+
+```
+constraint-annotation ::= 'where' '(' constraint-field (',' constraint-field)* ')'
+constraint-field     ::= 'layout' '=' layout-constraint
+                       | 'mesh' '=' mesh-expression
+                       | 'storage' '=' storage-expression
+layout-constraint    ::= layout-axis-tuple
+                       | '(' layout-axis-tuple ',' binding-set ')'
+binding-set          ::= '{' binding (',' binding)* '}'
+binding              ::= topology '@' 'B()'
+                       | topology '@' 'P(' string-literal ')'
+```
+
+`where(...)` is keyword-only and non-empty. A layout axis is `_`, an integer
+or symbolic extent, or `extent @ topology`. The split form binds an existing
+`Split` attribute to the physical layout position. `_` is a private
+constraint wildcard and is distinct from `Layout`'s `None` launch-provided
+extent. `B()` and `P(...)` reuse the existing `Broadcast` and `Partial`
+`ShardAttr` values; a topology may be bound at most once in one layout
+constraint. `mesh` resolves to a `Mesh`, and `storage` resolves through the
+current storage-kind registry. CTA capability checks do not occur in this
+parser surface.
+
 ## 2. DSL namespace surface
 
 ### 2.1 Model
@@ -770,7 +794,7 @@ sealed (verified) invariant is `body is None` ⟺ `variants != ()`
 variants. The `@base.specialize(...)` parse rejects a `pass`-bodied
 variant directly.
 
-### 4.1 GridRegionExpr carry-out lifting
+### 5.1 GridRegionExpr carry-out lifting
 
 Inside a `for i in tile(...)` body, an `ast.Assign` whose single
 `Name` target is already bound in *outer* scope is a loop-carried
@@ -788,6 +812,17 @@ nested `with` inside a loop body are rejected. A nested `for ... in
 tile/range(...)` IS allowed and lifts to a nested `GridRegionExpr`; the
 carry scan recurses into it, so an outer-scope name rebound only inside the
 nested loop is carried across both loops.
+
+### 5.2 Constraint attachment
+
+The HIR parser attaches one `ScheduleConstraintMetadata` record to one
+concrete tensor `Expr`. Tensor parameters, tensor-valued intermediate SSA
+values, and bound tensor-valued `TupleGetItem` values are valid subjects.
+Whole tuples, shape scalars, unit values, direct subscripts, and unresolved
+names are rejected. Inline and standalone annotations for the same Expr are
+duplicates, not merged declarations. Diagnostics identify the subject and
+retain the authored source location. Constraint metadata does not alter the
+tensor type or introduce an HIR node.
 
 ## 6. TIR parser
 

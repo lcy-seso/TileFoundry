@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from typing import Any
 
 from tilefoundry.ir.core import Call, Constant, Expr, Var, VerifyError
@@ -19,7 +20,19 @@ from tilefoundry.ir.types.dim import (
     DimVar,
     simplify_dim,
 )
-from tilefoundry.ir.types.shard.mesh import Mesh, Topology
+from tilefoundry.ir.types.shard import Broadcast, Layout, Mesh, Partial, Split, Topology
+from tilefoundry.ir.visitor import ExprMutator
+from tilefoundry.schedule.constraints import (
+    ConstraintProvenance,
+    LayoutConstraint,
+    MeshConstraint,
+    ScheduleConstraint,
+    ScheduleConstraintMetadata,
+    SourceLocation,
+    StorageConstraint,
+)
+from tilefoundry.schedule.constraints.layout import _LAYOUT_WILDCARD
+from tilefoundry.target import Target, resolve_target
 
 from .base import BaseExprVisitor, _constant_from_py, _warn_if_ir_object, extract_ast
 from .range_slice import RangeSlice
@@ -73,6 +86,7 @@ def parse_func(fn, *, topologies=(), specializations=(), target=None, extra_clos
     return _parse_func_node(
         node, closure, topologies=topologies,
         specializations=specializations, target=target,
+        source_filename=getattr(getattr(fn, "__code__", None), "co_filename", "<string>"),
     )
 
 def parse_func_source(src: str) -> Function:
@@ -120,9 +134,24 @@ def parse_func_source(src: str) -> Function:
 
     # Extract topologies from decorator AST
     parsed_topologies = _extract_topologies_from_decorator(func_node)
-    return _parse_func_node(func_node, closure, topologies=parsed_topologies)
+    parsed_target = _extract_target_from_decorator(func_node, closure)
+    return _parse_func_node(
+        func_node,
+        closure,
+        topologies=parsed_topologies,
+        target=parsed_target,
+        source_filename="<string>",
+    )
 
-def _parse_func_node(node: ast.FunctionDef, closure: dict[str, Any], *, topologies=(), specializations=(), target=None) -> Function:
+def _parse_func_node(
+    node: ast.FunctionDef,
+    closure: dict[str, Any],
+    *,
+    topologies=(),
+    specializations=(),
+    target=None,
+    source_filename: str = "<string>",
+) -> Function:
     env = LexicalEnv()
     params = _build_params(node, closure)
     for p in params:
@@ -133,7 +162,9 @@ def _parse_func_node(node: ast.FunctionDef, closure: dict[str, Any], *, topologi
         if t.name in topo_ns:
             raise VerifyError(f"duplicate topology name {t.name!r}")
         topo_ns[t.name] = t
-    visitor = _HirBodyVisitor(env, closure, topo_ns=topo_ns)
+    visitor = _HirBodyVisitor(
+        env, closure, topo_ns=topo_ns, source_filename=source_filename
+    )
     if _is_pass_body(node.body):
         # A `pass` body declares a dispatch prototype: signature + envelope
         # only, no implementation (hir §5). Its variants carry the bodies.
@@ -141,6 +172,9 @@ def _parse_func_node(node: ast.FunctionDef, closure: dict[str, Any], *, topologi
     else:
         body_expr = visitor.visit_body(node.body)
     return_type = _resolve_return_type(node, closure, body_expr)
+    params, body_expr = _finalize_schedule_metadata(
+        params, body_expr, visitor.pending_constraints
+    )
     return Function.build(
         name=node.name,
         params=params,
@@ -150,6 +184,38 @@ def _parse_func_node(node: ast.FunctionDef, closure: dict[str, Any], *, topologi
         specializations=tuple(specializations),
         target=target,
     )
+
+
+class _ScheduleMetadataFinalizer(ExprMutator):
+    """Rebuild the parsed DAG so metadata follows shared SSA identity."""
+
+    def __init__(self, pending: dict[int, ScheduleConstraintMetadata]) -> None:
+        self.pending = pending
+        self.memo: dict[int, Expr] = {}
+
+    def visit(self, expr: Expr) -> Expr:
+        cached = self.memo.get(id(expr))
+        if cached is not None:
+            return cached
+        rebuilt = super().visit(expr)
+        metadata = self.pending.get(id(expr))
+        if metadata is not None:
+            rebuilt = dataclasses.replace(
+                rebuilt, metadata=(*rebuilt.metadata, metadata)
+            )
+        self.memo[id(expr)] = rebuilt
+        return rebuilt
+
+
+def _finalize_schedule_metadata(
+    params: tuple[Var, ...],
+    body: Expr | None,
+    pending: dict[int, ScheduleConstraintMetadata],
+) -> tuple[tuple[Var, ...], Expr | None]:
+    finalizer = _ScheduleMetadataFinalizer(pending)
+    new_params = tuple(finalizer.visit(param) for param in params)
+    new_body = None if body is None else finalizer.visit(body)
+    return new_params, new_body
 
 def _extract_topologies_from_decorator(node: ast.FunctionDef) -> list["Topology"]:
     """Parse ``@func(topologies=(...))`` from the function's decorator AST.
@@ -180,6 +246,67 @@ def _extract_topologies_from_decorator(node: ast.FunctionDef) -> list["Topology"
                     # Single variable reference from closure (legacy)
                     pass  # handled by the decorator's runtime kwarg passing
     return result
+
+
+def _eval_decorator_static(node: ast.AST, closure: dict[str, Any]):
+    """Evaluate the static expression subset used by decorator kwargs."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        try:
+            return closure[node.id]
+        except KeyError as exc:
+            raise VerifyError(
+                f"undefined name in decorator argument: {node.id!r}"
+            ) from exc
+    if isinstance(node, ast.Attribute):
+        owner = _eval_decorator_static(node.value, closure)
+        try:
+            return getattr(owner, node.attr)
+        except AttributeError as exc:
+            raise VerifyError(
+                f"unknown decorator attribute {node.attr!r} on "
+                f"{type(owner).__name__}"
+            ) from exc
+    if isinstance(node, ast.Tuple):
+        return tuple(_eval_decorator_static(item, closure) for item in node.elts)
+    if isinstance(node, ast.List):
+        return [_eval_decorator_static(item, closure) for item in node.elts]
+    if isinstance(node, ast.Call):
+        if any(keyword.arg is None for keyword in node.keywords):
+            raise VerifyError("decorator arguments do not accept **kwargs")
+        fn = _eval_decorator_static(node.func, closure)
+        args = tuple(_eval_decorator_static(arg, closure) for arg in node.args)
+        kwargs = {
+            keyword.arg: _eval_decorator_static(keyword.value, closure)
+            for keyword in node.keywords
+        }
+        return fn(*args, **kwargs)
+    raise VerifyError(
+        f"unsupported decorator argument {type(node).__name__}; "
+        "expected a static target value"
+    )
+
+
+def _extract_target_from_decorator(
+    node: ast.FunctionDef, closure: dict[str, Any]
+) -> Target | None:
+    """Parse an explicit target value from an @func decorator."""
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call) or not _is_func_decorator(dec):
+            continue
+        for keyword in dec.keywords:
+            if keyword.arg != "target":
+                continue
+            value = _eval_decorator_static(keyword.value, closure)
+            try:
+                target = resolve_target(value)
+            except (TypeError, ValueError) as exc:
+                raise VerifyError(
+                    f"func target must resolve to a Target, got {value!r}"
+                ) from exc
+            return target
+    return None
 
 def _parse_topology_item(node: ast.AST) -> "Topology | None":
     """Parse a single topology declaration from an AST node.
@@ -240,6 +367,101 @@ def _eval_topology_expr(node: ast.AST) -> int | None:
                 return -val
         return None
     return None
+
+
+def _constraint_value(node: ast.AST):
+    """Read a stage-neutral layout extent or topology reference."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return ast.unparse(node)
+    raise VerifyError(
+        f"where layout extent must be a literal or symbolic name, got "
+        f"{type(node).__name__}"
+    )
+
+
+def _parse_partial_value(node: ast.AST) -> Partial:
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        raise VerifyError('Partial binding must use P("reduction")')
+    if node.func.id != "P" or len(node.args) != 1 or node.keywords:
+        raise VerifyError('Partial binding must use P("reduction")')
+    value = _constraint_value(node.args[0])
+    if not isinstance(value, str) or not value:
+        raise VerifyError("partial reduction must be a non-empty string")
+    return Partial(value)
+
+
+def _parse_binding_set(node: ast.AST) -> list[tuple[str, Broadcast | Partial]]:
+    if not isinstance(node, ast.Set):
+        raise VerifyError("layout bindings must be a set")
+    out: list[tuple[str, Broadcast | Partial]] = []
+    for item in node.elts:
+        if not isinstance(item, ast.BinOp) or not isinstance(item.op, ast.MatMult):
+            raise VerifyError('layout bindings must use `topology @ B()` or `P()`')
+        topology = _constraint_value(item.left)
+        if not isinstance(topology, str) or not topology:
+            raise VerifyError("layout binding topology must be symbolic")
+        if (
+            isinstance(item.right, ast.Call)
+            and isinstance(item.right.func, ast.Name)
+            and item.right.func.id == "B"
+            and not item.right.args
+            and not item.right.keywords
+        ):
+            attr: Broadcast | Partial = Broadcast()
+        else:
+            attr = _parse_partial_value(item.right)
+        out.append((topology, attr))
+    return out
+
+
+def _parse_layout_constraint(
+    node: ast.AST,
+) -> LayoutConstraint:
+    if not isinstance(node, ast.Tuple):
+        raise VerifyError("layout constraint must be a tuple")
+    dims_node = node
+    extras: tuple[ast.AST, ...] = ()
+    if node.elts and isinstance(node.elts[0], ast.Tuple):
+        dims_node = node.elts[0]
+        extras = tuple(node.elts[1:])
+        if len(extras) > 1:
+            raise VerifyError("layout constraint accepts one binding set")
+    if not dims_node.elts:
+        raise VerifyError("layout constraint cannot be empty")
+    shape: list[object] = []
+    bindings: list[tuple[str, Split | Broadcast | Partial]] = []
+    for index, item in enumerate(dims_node.elts):
+        if isinstance(item, ast.Name) and item.id == "_":
+            shape.append(_LAYOUT_WILDCARD)
+            continue
+        if isinstance(item, ast.Name) and item.id == "D":
+            raise VerifyError("layout broadcast must use a `{topology @ B()}` binding")
+        if isinstance(item, ast.BinOp) and isinstance(item.op, ast.MatMult):
+            extent = _constraint_value(item.left)
+            topology = _constraint_value(item.right)
+            if not isinstance(topology, str) or not topology:
+                raise VerifyError("layout topology binding must be symbolic")
+            if isinstance(extent, bool) or not isinstance(extent, (int, str)):
+                raise VerifyError("layout split extent must be an integer or symbolic name")
+            shape.append(extent)
+            bindings.append((topology, Split(index)))
+            continue
+        extent = _constraint_value(item)
+        if isinstance(extent, bool) or not isinstance(extent, (int, str)):
+            raise VerifyError(
+                "layout dimensions must use `_`, an integer, or a symbolic "
+                "extent with `@ topology`"
+            )
+        shape.append(extent)
+    if extras:
+        bindings.extend(_parse_binding_set(extras[0]))
+    if len({topology for topology, _ in bindings}) != len(bindings):
+        raise VerifyError("layout constraint cannot bind one topology more than once")
+    return LayoutConstraint(layout=Layout(shape=tuple(shape)), bindings=tuple(bindings))
 
 def _is_func_decorator(dec: ast.AST) -> bool:
     """Check if an AST decorator node is ``@func`` or ``@func(...)``."""
@@ -332,9 +554,11 @@ def _resolve_return_type(node: ast.FunctionDef, closure, body_expr) -> TensorTyp
 class _HirBodyVisitor(BaseExprVisitor):
     token = "hir"
 
-    def __init__(self, env, closure, *, topo_ns=None):
+    def __init__(self, env, closure, *, topo_ns=None, source_filename="<string>"):
         super().__init__(env, closure)
         self.topo_ns: dict[str, "Topology"] = topo_ns or {}
+        self.source_filename = source_filename
+        self.pending_constraints: dict[int, ScheduleConstraintMetadata] = {}
 
     # Function body: assignment statements only update the symtab; hir is
     # SSA-as-DAG (§8.6), so variable sharing is expressed by the tail Expr
@@ -423,6 +647,8 @@ class _HirBodyVisitor(BaseExprVisitor):
                     self.env.define(nm, item)
                 return self._visit_chain(stmts, idx + 1, require_return)
             raise VerifyError("hir: only single-target Name or Tuple assignments supported in V1")
+        if isinstance(node, ast.AnnAssign):
+            return self._visit_annotated_assignment(node, stmts, idx, require_return)
         if isinstance(node, ast.With):
             return self._visit_with(node, stmts, idx, require_return)
         if isinstance(node, ast.Expr):
@@ -433,6 +659,129 @@ class _HirBodyVisitor(BaseExprVisitor):
         if isinstance(node, ast.For):
             return self._visit_loop_for(node, stmts, idx, require_return)
         raise VerifyError(f"hir: unsupported statement {type(node).__name__}")
+
+    def _visit_annotated_assignment(
+        self,
+        node: ast.AnnAssign,
+        stmts: list[ast.stmt],
+        idx: int,
+        require_return: bool,
+    ) -> Expr | None:
+        if not isinstance(node.target, ast.Name):
+            raise VerifyError(
+                "where annotation target must be a bound plain Name; "
+                "subscripts are not annotation lvalues"
+            )
+        if node.value is None:
+            target = self.env.lookup(node.target.id)
+            if not isinstance(target, Expr):
+                raise VerifyError(
+                    f"where annotation target {node.target.id!r} is unresolved "
+                    f"at {self.source_filename}:{node.lineno}:{node.col_offset}"
+                )
+        else:
+            target = self._maybe_autofill_loc(
+                self.expr(node.value), node.target.id
+            )
+            self.env.define(node.target.id, target)
+        self._record_annotated_assignment(node, target)
+        return self._visit_chain(stmts, idx + 1, require_return)
+
+    def _record_annotated_assignment(self, node: ast.AnnAssign, target: Expr) -> None:
+        metadata = self._parse_where_annotation(node.annotation, node)
+        if not isinstance(target.type, TensorType):
+            raise VerifyError(
+                f"where annotation requires a tensor-valued Expr at "
+                f"{target.loc or self.source_filename}:{node.lineno}:{node.col_offset}"
+            )
+        if id(target) in self.pending_constraints:
+            previous = self.pending_constraints[id(target)].source_loc.describe()
+            current = metadata.source_loc.describe()
+            raise VerifyError(
+                f"duplicate where annotation for Expr {target.loc or '<unnamed>'!r} "
+                f"at {current}; first annotation at {previous}"
+            )
+        self.pending_constraints[id(target)] = metadata
+
+    def _parse_where_annotation(
+        self, annotation: ast.AST, node: ast.AnnAssign
+    ) -> ScheduleConstraintMetadata:
+        if not isinstance(annotation, ast.Call) or not isinstance(
+            annotation.func, ast.Name
+        ) or annotation.func.id != "where":
+            raise VerifyError(
+                "annotations must use `where(...)`; positional or other forms "
+                "are not supported"
+            )
+        if annotation.args:
+            raise VerifyError("where(...) accepts keyword arguments only")
+        if not annotation.keywords:
+            raise VerifyError("where(...) cannot be empty")
+        source_loc = SourceLocation(
+            filename=self.source_filename,
+            line=node.lineno,
+            column=node.col_offset,
+            end_line=getattr(node, "end_lineno", None),
+            end_column=getattr(node, "end_col_offset", None),
+        )
+        constraints: list[ScheduleConstraint] = []
+        fields: set[str] = set()
+        for keyword in annotation.keywords:
+            if keyword.arg is None:
+                raise VerifyError("where(...) does not accept **kwargs")
+            if keyword.arg in fields:
+                raise VerifyError(
+                    f"where(...) repeats keyword {keyword.arg!r} at "
+                    f"{source_loc.describe()}"
+                )
+            fields.add(keyword.arg)
+            if keyword.arg == "layout":
+                layout = _parse_layout_constraint(keyword.value)
+                constraints.append(
+                    dataclasses.replace(
+                        layout,
+                        source_loc=source_loc,
+                        provenance=ConstraintProvenance.AUTHOR,
+                    )
+                )
+            elif keyword.arg == "mesh":
+                try:
+                    mesh = self._eval_static(keyword.value)
+                except (TypeError, ValueError, VerifyError) as exc:
+                    raise VerifyError(
+                        f"where mesh constraint could not be resolved at "
+                        f"{source_loc.describe()}: {exc}"
+                    ) from exc
+                constraints.append(
+                    MeshConstraint(
+                        mesh=mesh,
+                        source_loc=source_loc,
+                        provenance=ConstraintProvenance.AUTHOR,
+                    )
+                )
+            elif keyword.arg == "storage":
+                try:
+                    storage = self._eval_static(keyword.value)
+                except (TypeError, ValueError, VerifyError) as exc:
+                    raise VerifyError(
+                        f"where storage constraint could not be resolved at "
+                        f"{source_loc.describe()}: {exc}"
+                    ) from exc
+                constraints.append(
+                    StorageConstraint(
+                        storage=storage,
+                        source_loc=source_loc,
+                        provenance=ConstraintProvenance.AUTHOR,
+                    )
+                )
+            else:
+                raise VerifyError(
+                    f"where(...) has unknown field {keyword.arg!r}; use "
+                    "layout=..., mesh=..., or storage=..."
+                )
+        return ScheduleConstraintMetadata(
+            constraints=tuple(constraints), source_loc=source_loc
+        )
 
     def _resolve_loop_bound(self, node: ast.AST):
         """Resolve a ``tile`` / ``range`` bound (extent / step / start) to an
@@ -990,6 +1339,12 @@ def _parse_module_source_tree(tree: ast.Module) -> Function:
     exec("\n".join(prelude_lines), closure)
 
     parsed_topologies = _extract_topologies_from_decorator(func_node)
-    return _parse_func_node(func_node, closure, topologies=parsed_topologies)
+    parsed_target = _extract_target_from_decorator(func_node, closure)
+    return _parse_func_node(
+        func_node,
+        closure,
+        topologies=parsed_topologies,
+        target=parsed_target,
+    )
 
 __all__ = ["parse_func", "parse_func_source", "parse_module_source", "parse_script"]
